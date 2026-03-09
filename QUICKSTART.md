@@ -9,6 +9,10 @@ cp .env.example .env
 Edit `.env`:
 
 - `OCI_PROFILE` to your profile name in mounted `.oci/config`
+- `WATCHER_IMAGE` to the image tag you want (default points to GHCR release)
+- `CONTAINER_USER`:
+  - keep `0` for maximum compatibility with strict `.oci` file permissions
+  - set non-root uid:gid only if mounted files are readable by that user
 - `OCI_MOUNT_DIR` to host directory containing `.oci/config` and key files
 - `SSH_PUBLIC_KEY_FILE` to host public key path
 - `VM_PROFILE_SOURCE_FILE` to host tfvars profile source
@@ -22,7 +26,7 @@ For Unraid notification support:
 ## 2) Start watcher
 
 ```bash
-docker compose up -d --build
+docker compose up -d
 ```
 
 ## 3) Check logs
