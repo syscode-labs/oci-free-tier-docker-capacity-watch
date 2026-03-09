@@ -22,7 +22,7 @@ jobs:
 
       - name: Compute release tag
         id: tag
-        run: echo "tag=v0.0.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+        run: echo "tag=v$(date -u +%Y.%m.%d).${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
