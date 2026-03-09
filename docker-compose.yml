@@ -1,7 +1,7 @@
 services:
   watcher:
-    image: ${WATCHER_IMAGE:-ghcr.io/syscode-labs/oci-freetier-docker-capacity-watch:v0.1.1}
-    container_name: oci-freetier-capacity-watcher
+    image: ${WATCHER_IMAGE:-ghcr.io/syscode-labs/oci-free-tier-docker-capacity-watch:v0.1.1}
+    container_name: oci-free-tier-capacity-watcher
     restart: unless-stopped
     user: ${CONTAINER_USER:-0}
     environment:

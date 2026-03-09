@@ -1,8 +1,8 @@
-# oci-freetier-docker-capacity-watch
-[![CI](https://github.com/syscode-labs/oci-freetier-docker-capacity-watch/actions/workflows/ci.yml/badge.svg)](https://github.com/syscode-labs/oci-freetier-docker-capacity-watch/actions/workflows/ci.yml)
-[![Release Image](https://github.com/syscode-labs/oci-freetier-docker-capacity-watch/actions/workflows/release-image.yml/badge.svg)](https://github.com/syscode-labs/oci-freetier-docker-capacity-watch/actions/workflows/release-image.yml)
-[![GitHub Release](https://img.shields.io/github/v/release/syscode-labs/oci-freetier-docker-capacity-watch)](https://github.com/syscode-labs/oci-freetier-docker-capacity-watch/releases)
-[![GHCR](https://img.shields.io/badge/GHCR-ghcr.io%2Fsyscode--labs%2Foci--freetier--docker--capacity--watch-blue)](https://ghcr.io/syscode-labs/oci-freetier-docker-capacity-watch)
+# oci-free-tier-docker-capacity-watch
+[![CI](https://github.com/syscode-labs/oci-free-tier-docker-capacity-watch/actions/workflows/ci.yml/badge.svg)](https://github.com/syscode-labs/oci-free-tier-docker-capacity-watch/actions/workflows/ci.yml)
+[![Release Image](https://github.com/syscode-labs/oci-free-tier-docker-capacity-watch/actions/workflows/release-image.yml/badge.svg)](https://github.com/syscode-labs/oci-free-tier-docker-capacity-watch/actions/workflows/release-image.yml)
+[![GitHub Release](https://img.shields.io/github/v/release/syscode-labs/oci-free-tier-docker-capacity-watch)](https://github.com/syscode-labs/oci-free-tier-docker-capacity-watch/releases)
+[![GHCR](https://img.shields.io/badge/GHCR-ghcr.io%2Fsyscode--labs%2Foci--free--tier--docker--capacity--watch-blue)](https://ghcr.io/syscode-labs/oci-free-tier-docker-capacity-watch)
 
 Dockerized OCI free-tier capacity watcher that retries until your target VM profile is provisioned.
 

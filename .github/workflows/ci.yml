@@ -35,4 +35,4 @@ jobs:
 
       - name: Build Docker image
         run: |
-          docker build -t oci-freetier-docker-capacity-watch:ci .
+          docker build -t oci-free-tier-docker-capacity-watch:ci .
