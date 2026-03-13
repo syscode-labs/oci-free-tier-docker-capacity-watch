@@ -13,13 +13,16 @@ import argparse
 import configparser
 import json
 import os
-import subprocess
 import sys
 import time
 from datetime import datetime
 import math
 from pathlib import Path
 from typing import Any
+
+import oci
+from oci.exceptions import ServiceError
+from oci.pagination import list_call_get_all_results
 
 
 def log(msg: str) -> None:
@@ -32,32 +35,299 @@ class OciCliError(RuntimeError):
 
 
 class OciCli:
-    def __init__(self, profile: str, region: str | None = None) -> None:
+    def __init__(self, profile: str, region: str | None = None, config: dict[str, Any] | None = None) -> None:
         self.profile = profile
         self.region = region
+        config_file = os.environ.get("OCI_CONFIG_FILE")
+        self.config = config or oci.config.from_file(file_location=config_file, profile_name=profile)
+        if region:
+            self.config["region"] = region
+        self.identity_client = oci.identity.IdentityClient(self.config)
+        self.network_client = oci.core.VirtualNetworkClient(self.config)
+        self.compute_client = oci.core.ComputeClient(self.config)
+        self.lb_client = oci.load_balancer.LoadBalancerClient(self.config)
+
+    @staticmethod
+    def _flag(args: list[str], name: str, default: str | None = None) -> str | None:
+        try:
+            idx = args.index(name)
+        except ValueError:
+            return default
+        if idx + 1 >= len(args):
+            raise OciCliError(f"Missing value for {name}")
+        return args[idx + 1]
+
+    @staticmethod
+    def _require_flag(args: list[str], name: str) -> str:
+        value = OciCli._flag(args, name)
+        if value is None:
+            raise OciCliError(f"Missing required argument: {name}")
+        return value
+
+    @staticmethod
+    def _to_bool(value: str | None, default: bool = False) -> bool:
+        if value is None:
+            return default
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    @staticmethod
+    def _to_cli_dict(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key.replace("_", "-"): OciCli._to_cli_dict(val) for key, val in value.items()}
+        if isinstance(value, list):
+            return [OciCli._to_cli_dict(item) for item in value]
+        return value
+
+    def _data(self, payload: Any) -> dict[str, Any]:
+        return {"data": self._to_cli_dict(oci.util.to_dict(payload))}
+
+    def _list_all(self, fn: Any, **kwargs: Any) -> dict[str, Any]:
+        payload = list_call_get_all_results(fn, **kwargs).data
+        return self._data(payload)
+
+    def _load_balancer_create_details(self, args: list[str]) -> Any:
+        shape_details_raw = json.loads(self._require_flag(args, "--shape-details"))
+        subnet_ids = json.loads(self._require_flag(args, "--subnet-ids"))
+        shape_details = oci.load_balancer.models.ShapeDetails(
+            minimum_bandwidth_in_mbps=int(shape_details_raw["minimumBandwidthInMbps"]),
+            maximum_bandwidth_in_mbps=int(shape_details_raw["maximumBandwidthInMbps"]),
+        )
+        return oci.load_balancer.models.CreateLoadBalancerDetails(
+            compartment_id=self._require_flag(args, "--compartment-id"),
+            display_name=self._require_flag(args, "--display-name"),
+            shape_name=self._require_flag(args, "--shape-name"),
+            shape_details=shape_details,
+            subnet_ids=subnet_ids,
+            is_private=self._to_bool(self._flag(args, "--is-private"), default=False),
+        )
+
+    def _launch_instance_details(self, args: list[str]) -> Any:
+        ssh_key_file = self._require_flag(args, "--ssh-authorized-keys-file")
+        ssh_public_key = Path(ssh_key_file).read_text(encoding="utf-8").strip()
+        launch_details = oci.core.models.LaunchInstanceDetails(
+            availability_domain=self._require_flag(args, "--availability-domain"),
+            compartment_id=self._require_flag(args, "--compartment-id"),
+            shape=self._require_flag(args, "--shape"),
+            display_name=self._require_flag(args, "--display-name"),
+            source_details=oci.core.models.InstanceSourceViaImageDetails(
+                source_type="image",
+                image_id=self._require_flag(args, "--image-id"),
+                boot_volume_size_in_gbs=int(self._require_flag(args, "--boot-volume-size-in-gbs")),
+            ),
+            create_vnic_details=oci.core.models.CreateVnicDetails(
+                subnet_id=self._require_flag(args, "--subnet-id"),
+                assign_public_ip=self._to_bool(self._flag(args, "--assign-public-ip"), default=True),
+            ),
+            metadata={"ssh_authorized_keys": ssh_public_key},
+        )
+        shape_config = self._flag(args, "--shape-config")
+        if shape_config:
+            shape_config_data = json.loads(shape_config)
+            launch_details.shape_config = oci.core.models.LaunchInstanceShapeConfigDetails(
+                ocpus=float(shape_config_data["ocpus"]),
+                memory_in_gbs=float(shape_config_data["memoryInGBs"]),
+            )
+        return launch_details
 
     def run(self, args: list[str], expect_json: bool = True) -> Any:
-        cmd = ["oci", "--profile", self.profile]
-        if self.region:
-            cmd.extend(["--region", self.region])
-        cmd.extend(args)
-
-        env = os.environ.copy()
-        env.pop("OCI_OUTPUT_ENV_FILE", None)
-        proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
-        if proc.returncode != 0:
-            raise OciCliError(proc.stderr.strip() or proc.stdout.strip() or "OCI CLI command failed")
-
-        if not expect_json:
-            return proc.stdout.strip()
-
-        if proc.stdout.strip() == "":
-            return {"data": []}
-
         try:
-            return json.loads(proc.stdout)
-        except json.JSONDecodeError as exc:
-            raise OciCliError(f"Failed to parse JSON output for command: {' '.join(cmd)}") from exc
+            command = tuple(args[:3])
+            if command == ("iam", "compartment", "list"):
+                return self._list_all(
+                    self.identity_client.list_compartments,
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                    name=self._flag(args, "--name"),
+                    access_level=self._flag(args, "--access-level"),
+                    compartment_id_in_subtree=self._to_bool(self._flag(args, "--compartment-id-in-subtree")),
+                    lifecycle_state=self._flag(args, "--lifecycle-state"),
+                )
+            if command == ("iam", "compartment", "create"):
+                details = oci.identity.models.CreateCompartmentDetails(
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                    name=self._require_flag(args, "--name"),
+                    description=self._require_flag(args, "--description"),
+                )
+                return self._data(self.identity_client.create_compartment(details).data)
+            if command == ("iam", "availability-domain", "list"):
+                return self._list_all(
+                    self.identity_client.list_availability_domains,
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                )
+            if command == ("network", "vcn", "list"):
+                return self._list_all(
+                    self.network_client.list_vcns,
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                )
+            if command == ("network", "vcn", "create"):
+                details = oci.core.models.CreateVcnDetails(
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                    display_name=self._require_flag(args, "--display-name"),
+                    cidr_blocks=[self._require_flag(args, "--cidr-block")],
+                    dns_label=self._require_flag(args, "--dns-label"),
+                )
+                return self._data(self.network_client.create_vcn(details).data)
+            if command == ("network", "internet-gateway", "list"):
+                return self._list_all(
+                    self.network_client.list_internet_gateways,
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                )
+            if command == ("network", "internet-gateway", "create"):
+                details = oci.core.models.CreateInternetGatewayDetails(
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                    vcn_id=self._require_flag(args, "--vcn-id"),
+                    display_name=self._require_flag(args, "--display-name"),
+                    is_enabled=self._to_bool(self._flag(args, "--is-enabled"), default=True),
+                )
+                return self._data(self.network_client.create_internet_gateway(details).data)
+            if command == ("network", "route-table", "list"):
+                return self._list_all(
+                    self.network_client.list_route_tables,
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                )
+            if command == ("network", "route-table", "create"):
+                route_rules_raw = json.loads(self._require_flag(args, "--route-rules"))
+                route_rules = [
+                    oci.core.models.RouteRule(
+                        destination=rule["destination"],
+                        destination_type=rule["destinationType"],
+                        network_entity_id=rule["networkEntityId"],
+                    )
+                    for rule in route_rules_raw
+                ]
+                details = oci.core.models.CreateRouteTableDetails(
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                    vcn_id=self._require_flag(args, "--vcn-id"),
+                    display_name=self._require_flag(args, "--display-name"),
+                    route_rules=route_rules,
+                )
+                return self._data(self.network_client.create_route_table(details).data)
+            if command == ("network", "security-list", "list"):
+                return self._list_all(
+                    self.network_client.list_security_lists,
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                )
+            if command == ("network", "security-list", "create"):
+                ingress_raw = json.loads(self._require_flag(args, "--ingress-security-rules"))
+                egress_raw = json.loads(self._require_flag(args, "--egress-security-rules"))
+                ingress_rules = [
+                    oci.core.models.IngressSecurityRule(
+                        source=rule["source"],
+                        source_type=rule.get("sourceType", "CIDR_BLOCK"),
+                        protocol=rule["protocol"],
+                        tcp_options=oci.core.models.TcpOptions(
+                            destination_port_range=oci.core.models.PortRange(
+                                min=int(rule["tcpOptions"]["destinationPortRange"]["min"]),
+                                max=int(rule["tcpOptions"]["destinationPortRange"]["max"]),
+                            )
+                        )
+                        if "tcpOptions" in rule
+                        else None,
+                    )
+                    for rule in ingress_raw
+                ]
+                egress_rules = [
+                    oci.core.models.EgressSecurityRule(
+                        destination=rule["destination"],
+                        destination_type=rule.get("destinationType", "CIDR_BLOCK"),
+                        protocol=rule["protocol"],
+                        tcp_options=oci.core.models.TcpOptions(
+                            destination_port_range=oci.core.models.PortRange(
+                                min=int(rule["tcpOptions"]["destinationPortRange"]["min"]),
+                                max=int(rule["tcpOptions"]["destinationPortRange"]["max"]),
+                            )
+                        )
+                        if "tcpOptions" in rule
+                        else None,
+                    )
+                    for rule in egress_raw
+                ]
+                details = oci.core.models.CreateSecurityListDetails(
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                    vcn_id=self._require_flag(args, "--vcn-id"),
+                    display_name=self._require_flag(args, "--display-name"),
+                    ingress_security_rules=ingress_rules,
+                    egress_security_rules=egress_rules,
+                )
+                return self._data(self.network_client.create_security_list(details).data)
+            if command == ("network", "subnet", "list"):
+                return self._list_all(
+                    self.network_client.list_subnets,
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                )
+            if command == ("network", "subnet", "create"):
+                details = oci.core.models.CreateSubnetDetails(
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                    vcn_id=self._require_flag(args, "--vcn-id"),
+                    display_name=self._require_flag(args, "--display-name"),
+                    cidr_block=self._require_flag(args, "--cidr-block"),
+                    dns_label=self._require_flag(args, "--dns-label"),
+                    route_table_id=self._require_flag(args, "--route-table-id"),
+                    security_list_ids=json.loads(self._require_flag(args, "--security-list-ids")),
+                )
+                return self._data(self.network_client.create_subnet(details).data)
+            if command == ("lb", "load-balancer", "get"):
+                return self._data(
+                    self.lb_client.get_load_balancer(
+                        load_balancer_id=self._require_flag(args, "--load-balancer-id")
+                    ).data
+                )
+            if command == ("lb", "load-balancer", "list"):
+                return self._list_all(
+                    self.lb_client.list_load_balancers,
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                )
+            if command == ("lb", "load-balancer", "create"):
+                details = self._load_balancer_create_details(args)
+                return self._data(self.lb_client.create_load_balancer(details).data)
+            if command == ("compute", "image", "list"):
+                return self._list_all(
+                    self.compute_client.list_images,
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                    operating_system=self._flag(args, "--operating-system"),
+                    operating_system_version=self._flag(args, "--operating-system-version"),
+                    shape=self._flag(args, "--shape"),
+                    sort_by=self._flag(args, "--sort-by"),
+                    sort_order=self._flag(args, "--sort-order"),
+                )
+            if command == ("compute", "instance", "list"):
+                return self._list_all(
+                    self.compute_client.list_instances,
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                )
+            if command == ("compute", "compute-capacity-report", "create"):
+                shape_availabilities_raw = json.loads(self._require_flag(args, "--shape-availabilities"))
+                shape_availabilities = []
+                for item in shape_availabilities_raw:
+                    cfg = item.get("instance-shape-config")
+                    cfg_model = None
+                    if cfg:
+                        cfg_model = oci.core.models.CapacityReportInstanceShapeConfig(
+                            ocpus=float(cfg["ocpus"]),
+                            memory_in_gbs=float(cfg["memory-in-gbs"]),
+                        )
+                    shape_availabilities.append(
+                        oci.core.models.CreateCapacityReportShapeAvailabilityDetails(
+                            instance_shape=item["instance-shape"],
+                            instance_shape_config=cfg_model,
+                        )
+                    )
+                details = oci.core.models.CreateComputeCapacityReportDetails(
+                    availability_domain=self._require_flag(args, "--availability-domain"),
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                    shape_availabilities=shape_availabilities,
+                )
+                return self._data(self.compute_client.create_compute_capacity_report(details).data)
+            if command == ("compute", "instance", "launch"):
+                details = self._launch_instance_details(args)
+                return self._data(self.compute_client.launch_instance(details).data)
+            raise OciCliError(f"Unsupported OCI command mapping: {' '.join(args)}")
+        except ServiceError as exc:
+            message = exc.message or str(exc)
+            raise OciCliError(message) from exc
+        except OciCliError:
+            raise
+        except Exception as exc:
+            raise OciCliError(str(exc)) from exc
 
 
 CAPACITY_PATTERNS = [
@@ -608,7 +878,7 @@ def launch_instance(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Provision OCI Always Free resources with retry")
-    parser.add_argument("--profile", default="gf78", help="OCI CLI profile to use")
+    parser.add_argument("--profile", default="gf78", help="OCI config profile to use")
     parser.add_argument("--compartment-name", default="gf78-free-tier-dedicated", help="Dedicated compartment name")
     parser.add_argument("--region", default="", help="OCI region override (default: from profile)")
     parser.add_argument("--ssh-key-file", default=str(Path.home() / ".ssh" / "id_rsa.pub"))
