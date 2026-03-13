@@ -78,10 +78,22 @@ def read_profile_values(profile: str) -> dict[str, str]:
     parser = configparser.ConfigParser()
     parser.read(config_path)
 
-    if profile not in parser:
-        raise RuntimeError(f"Profile '{profile}' not found in {config_path}")
+    normalized = profile.strip()
+    if normalized in parser:
+        section_name = normalized
+    else:
+        section_name = ""
+        for candidate in parser.sections():
+            if candidate.strip().lower() == normalized.lower():
+                section_name = candidate
+                break
+        if not section_name:
+            available = ", ".join(parser.sections()) or "(none)"
+            raise RuntimeError(
+                f"Profile '{profile}' not found in {config_path}. Available: {available}"
+            )
 
-    section = parser[profile]
+    section = parser[section_name]
     required = ["tenancy", "user", "region"]
     missing = [key for key in required if key not in section]
     if missing:
