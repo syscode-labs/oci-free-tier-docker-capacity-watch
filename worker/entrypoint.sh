@@ -48,6 +48,15 @@ if [[ -f "$SUCCESS_MARKER" ]]; then
   exec tail -f /dev/null
 fi
 
+# Backward-compatible profile path resolution:
+# - legacy env: VM_PROFILE_FILE
+# - current env: PROFILE_DEFAULTS_FILE
+VM_PROFILE_FILE="${VM_PROFILE_FILE:-${PROFILE_DEFAULTS_FILE:-}}"
+if [[ -z "${VM_PROFILE_FILE}" ]]; then
+  echo "[entrypoint] missing VM_PROFILE_FILE/PROFILE_DEFAULTS_FILE"
+  exit 1
+fi
+
 python3 /app/worker/provision_free_tier_retry.py \
   --profile "${OCI_PROFILE}" \
   --compartment-name "${COMPARTMENT_NAME}" \
