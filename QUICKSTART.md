@@ -3,7 +3,9 @@
 ## 1) Prepare env
 
 ```bash
-cp .env.example .env
+mise trust
+mise env-gen
+# or: make env-gen
 ```
 
 Edit `.env`:
@@ -15,13 +17,21 @@ Edit `.env`:
   - set non-root uid:gid only if mounted files are readable by that user
 - `OCI_MOUNT_DIR` to host directory containing `.oci/config` and key files
 - `SSH_PUBLIC_KEY_FILE` to host public key path
-- `VM_PROFILE_SOURCE_FILE` to host tfvars profile source
+- `PROFILE_DEFAULTS_FILE` to host path for the shared profile JSON
+  (default file in repo: `profile.defaults.json`)
 - `NOTIFY_BACKEND` and optional notification settings
 
 For Unraid notification support:
 
 - set `NOTIFY_BACKEND=unraid`
 - set `UNRAID_NOTIFY_BIN=/usr/local/emhttp/webGui/scripts/notify`
+
+Optional local validation:
+
+```bash
+mise env-check
+# or: make env-check
+```
 
 ## 2) Start watcher
 

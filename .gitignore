@@ -1,4 +1,6 @@
 .env
+.oci/
+syscode.pub
 state/*
 !state/.gitkeep
 

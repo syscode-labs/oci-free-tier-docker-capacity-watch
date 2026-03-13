@@ -10,7 +10,7 @@ services:
       COMPARTMENT_NAME: ${COMPARTMENT_NAME:-oci-free-tier-dedicated}
       RETRY_SECONDS: ${RETRY_SECONDS:-300}
       MAX_ATTEMPTS: ${MAX_ATTEMPTS:-0}
-      VM_PROFILE_FILE: /app/worker/terraform.tfvars.example
+      PROFILE_DEFAULTS_FILE: /app/config/profile.defaults.json
       SSH_KEY_FILE: /run/keys/ssh_public_key.pub
       STATE_DIR: /state
       NOTIFY_BACKEND: ${NOTIFY_BACKEND:-none}
@@ -19,8 +19,8 @@ services:
     volumes:
       - ${OCI_MOUNT_DIR}:/run/oci:ro
       - ${SSH_PUBLIC_KEY_FILE}:/run/keys/ssh_public_key.pub:ro
+      - ${PROFILE_DEFAULTS_FILE}:/app/config/profile.defaults.json:ro
       - ./state:/state
-      - ${VM_PROFILE_SOURCE_FILE}:/app/worker/terraform.tfvars.example:ro
       - ${UNRAID_NOTIFY_BIN:-/dev/null}:/usr/local/bin/unraid-notify:ro
     read_only: true
     tmpfs:

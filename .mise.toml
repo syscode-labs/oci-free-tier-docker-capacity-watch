@@ -1,0 +1,19 @@
+[tasks.env-gen]
+description = "Create .env if missing and validate compose config"
+run = "make env-gen"
+
+[tasks.env-gen-force]
+description = "Recreate .env from template and validate compose config"
+run = "make env-gen-force"
+
+[tasks.env-check]
+description = "Validate local env files, profile JSON, and compose rendering"
+run = "make env-check"
+
+[tasks.apply]
+description = "Run watcher container directly (foreground)"
+run = "make apply"
+
+[tasks.default]
+description = "Alias for env-gen"
+depends = ["env-gen"]

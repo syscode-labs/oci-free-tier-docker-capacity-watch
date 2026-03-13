@@ -2,7 +2,7 @@
 """Provision OCI Always Free resources in a dedicated compartment with retry logic.
 
 - Creates/uses a dedicated compartment and basic public network stack.
-- Reads VM profile defaults from tofu/oci/terraform.tfvars.example.
+- Reads compute/LB profile defaults from a JSON profile file.
 - Launches VM.Standard.A1.Flex and VM.Standard.E2.1.Micro instances.
 - Retries launches on capacity errors until targets are met.
 """
@@ -13,7 +13,6 @@ import argparse
 import configparser
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -95,21 +94,59 @@ def read_profile_values(profile: str) -> dict[str, str]:
     }
 
 
-def parse_tfvars_profile(tfvars_file: Path) -> dict[str, float]:
-    text = tfvars_file.read_text(encoding="utf-8")
+def parse_bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
-    def get_number(name: str, default: float) -> float:
-        match = re.search(rf"^{name}\s*=\s*([0-9]+(?:\.[0-9]+)?)", text, flags=re.MULTILINE)
-        return float(match.group(1)) if match else default
 
-    return {
-        "ampere_instance_count": get_number("ampere_instance_count", 3),
-        "ampere_ocpus_per_instance": get_number("ampere_ocpus_per_instance", 1.33),
-        "ampere_memory_per_instance": get_number("ampere_memory_per_instance", 8),
-        "ampere_boot_volume_size": get_number("ampere_boot_volume_size", 50),
-        "micro_instance_count": get_number("micro_instance_count", 1),
-        "micro_boot_volume_size": get_number("micro_boot_volume_size", 50),
-    }
+def load_profile_defaults(path: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    required = [
+        "ampere_instance_count",
+        "ampere_ocpus_per_instance",
+        "ampere_memory_per_instance",
+        "ampere_boot_volume_size",
+        "micro_instance_count",
+        "micro_boot_volume_size",
+        "enable_free_lb",
+        "lb_display_name",
+    ]
+    missing = [k for k in required if k not in data]
+    if missing:
+        raise RuntimeError(
+            f"Profile defaults file '{path}' missing keys: {', '.join(missing)}"
+        )
+    int_keys = [
+        "ampere_instance_count",
+        "ampere_boot_volume_size",
+        "micro_instance_count",
+        "micro_boot_volume_size",
+    ]
+    for key in int_keys:
+        value = data[key]
+        if not isinstance(value, int):
+            raise RuntimeError(f"Profile key '{key}' must be an integer, got {type(value).__name__}")
+        if value < 0:
+            raise RuntimeError(f"Profile key '{key}' must be >= 0")
+
+    float_keys = ["ampere_ocpus_per_instance", "ampere_memory_per_instance"]
+    for key in float_keys:
+        value = data[key]
+        if not isinstance(value, (int, float)):
+            raise RuntimeError(f"Profile key '{key}' must be numeric, got {type(value).__name__}")
+        if float(value) <= 0:
+            raise RuntimeError(f"Profile key '{key}' must be > 0")
+
+    lb_enabled = data["enable_free_lb"]
+    if not isinstance(lb_enabled, bool):
+        raise RuntimeError("Profile key 'enable_free_lb' must be true/false")
+
+    lb_name = data["lb_display_name"]
+    if not isinstance(lb_name, str) or lb_name.strip() == "":
+        raise RuntimeError("Profile key 'lb_display_name' must be a non-empty string")
+
+    return data
 
 
 def resolve_ssh_public_key(path_value: str) -> str:
@@ -369,6 +406,69 @@ def ensure_subnet(
     return created["id"]
 
 
+def wait_load_balancer_active(oci: OciCli, lb_id: str, max_wait_seconds: int = 900) -> dict[str, Any]:
+    waited = 0
+    while waited <= max_wait_seconds:
+        data = oci.run(["lb", "load-balancer", "get", "--load-balancer-id", lb_id])["data"]
+        state = data.get("lifecycle-state", "")
+        if state == "ACTIVE":
+            return data
+        if state in {"FAILED", "DELETED"}:
+            raise RuntimeError(f"Load balancer entered terminal state: {state}")
+        time.sleep(10)
+        waited += 10
+    raise RuntimeError("Timed out waiting for load balancer to become ACTIVE")
+
+
+def ensure_free_tier_load_balancer(
+    oci: OciCli,
+    compartment_id: str,
+    subnet_id: str,
+    display_name: str,
+) -> tuple[str, str | None]:
+    lbs = oci.run(["lb", "load-balancer", "list", "--compartment-id", compartment_id, "--all"])["data"]
+    for lb in lbs:
+        if lb.get("display-name") == display_name:
+            lb_id = lb["id"]
+            log(f"Using existing Load Balancer '{display_name}' ({lb_id})")
+            active = wait_load_balancer_active(oci, lb_id)
+            ip_details = active.get("ip-address-details", [])
+            ip_address = ip_details[0].get("ip-address") if ip_details else None
+            return lb_id, ip_address
+
+    shape_details = json.dumps(
+        {
+            "minimumBandwidthInMbps": 10,
+            "maximumBandwidthInMbps": 10,
+        }
+    )
+    created = oci.run(
+        [
+            "lb",
+            "load-balancer",
+            "create",
+            "--compartment-id",
+            compartment_id,
+            "--display-name",
+            display_name,
+            "--shape-name",
+            "flexible",
+            "--shape-details",
+            shape_details,
+            "--subnet-ids",
+            json.dumps([subnet_id]),
+            "--is-private",
+            "false",
+        ]
+    )["data"]
+    lb_id = created["id"]
+    log(f"Created Load Balancer '{display_name}' ({lb_id}), waiting for ACTIVE")
+    active = wait_load_balancer_active(oci, lb_id)
+    ip_details = active.get("ip-address-details", [])
+    ip_address = ip_details[0].get("ip-address") if ip_details else None
+    return lb_id, ip_address
+
+
 def get_availability_domains(oci: OciCli, tenancy_ocid: str) -> list[str]:
     ads = oci.run(["iam", "availability-domain", "list", "--compartment-id", tenancy_ocid])["data"]
     return [ad["name"] for ad in ads]
@@ -503,9 +603,9 @@ def main() -> int:
     parser.add_argument("--retry-seconds", type=int, default=300, help="Seconds between capacity retry cycles")
     parser.add_argument("--max-attempts", type=int, default=0, help="0 = retry forever, otherwise stop after N cycles")
     parser.add_argument(
-        "--vm-profile-file",
-        default="tofu/oci/terraform.tfvars.example",
-        help="File to read VM profile defaults from",
+        "--profile-defaults-file",
+        default=os.environ.get("PROFILE_DEFAULTS_FILE", "/app/config/profile.defaults.json"),
+        help="JSON file containing compute/LB defaults",
     )
     args = parser.parse_args()
 
@@ -515,14 +615,14 @@ def main() -> int:
 
     ssh_key_file = resolve_ssh_public_key(args.ssh_key_file)
 
-    vm_profile = parse_tfvars_profile(Path(args.vm_profile_file))
-    ampere_target = int(vm_profile["ampere_instance_count"])
-    micro_target = int(vm_profile["micro_instance_count"])
+    profile_defaults = load_profile_defaults(Path(args.profile_defaults_file))
+    ampere_target = int(profile_defaults["ampere_instance_count"])
+    micro_target = int(profile_defaults["micro_instance_count"])
 
     log(f"Profile={args.profile} Region={region}")
     log(
-        "VM profile from repo: "
-        f"ampere={ampere_target} ({vm_profile['ampere_ocpus_per_instance']} OCPU/{vm_profile['ampere_memory_per_instance']}GB each), "
+        "VM profile from profile defaults: "
+        f"ampere={ampere_target} ({profile_defaults['ampere_ocpus_per_instance']} OCPU/{profile_defaults['ampere_memory_per_instance']}GB each), "
         f"micro={micro_target}"
     )
 
@@ -549,6 +649,17 @@ def main() -> int:
         cidr="10.0.1.0/24",
         dns_label="subnet",
     )
+    enable_free_lb = parse_bool(profile_defaults["enable_free_lb"])
+    if enable_free_lb:
+        lb_id, lb_ip = ensure_free_tier_load_balancer(
+            oci=oci,
+            compartment_id=compartment_id,
+            subnet_id=subnet_id,
+            display_name=str(profile_defaults["lb_display_name"]),
+        )
+        log(f"Load Balancer: {lb_id}")
+        if lb_ip:
+            log(f"Load Balancer public IP: {lb_ip}")
 
     ads = get_availability_domains(oci, tenancy_ocid)
     if not ads:
@@ -590,7 +701,7 @@ def main() -> int:
                 name=name,
                 shape="VM.Standard.E2.1.Micro",
                 image_id=micro_image_id,
-                boot_size=int(vm_profile["micro_boot_volume_size"]),
+                boot_size=int(profile_defaults["micro_boot_volume_size"]),
                 ssh_key_file=ssh_key_file,
             )
             if ok:
@@ -604,8 +715,8 @@ def main() -> int:
             name = f"ampere-instance-{idx + 1}"
             ad = ads[idx % len(ads)]
             shape_config = {
-                "ocpus": vm_profile["ampere_ocpus_per_instance"],
-                "memoryInGBs": vm_profile["ampere_memory_per_instance"],
+                "ocpus": float(profile_defaults["ampere_ocpus_per_instance"]),
+                "memoryInGBs": float(profile_defaults["ampere_memory_per_instance"]),
             }
             if not capacity_available(
                 oci=oci,
@@ -624,7 +735,7 @@ def main() -> int:
                 name=name,
                 shape="VM.Standard.A1.Flex",
                 image_id=ampere_image_id,
-                boot_size=int(vm_profile["ampere_boot_volume_size"]),
+                boot_size=int(profile_defaults["ampere_boot_volume_size"]),
                 ssh_key_file=ssh_key_file,
                 shape_config=shape_config,
             )
