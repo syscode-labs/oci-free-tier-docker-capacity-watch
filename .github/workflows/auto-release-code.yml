@@ -37,4 +37,5 @@ jobs:
         run: |
           gh workflow run release-image.yml \
             --repo "${{ github.repository }}" \
-            --ref "${{ steps.tag.outputs.tag }}"
+            --ref main \
+            -f "release_tag=${{ steps.tag.outputs.tag }}"
