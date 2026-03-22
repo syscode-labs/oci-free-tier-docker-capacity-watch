@@ -991,6 +991,82 @@ def launch_instance(
         return False, str(exc)
 
 
+def get_private_ip_id(oci: OciCli, compartment_id: str, instance_id: str) -> str:
+    """Return the primary private IP OCID for an instance."""
+    attachments = oci.run([
+        "compute", "vnic-attachment", "list",
+        "--compartment-id", compartment_id,
+        "--instance-id", instance_id,
+    ])["data"]
+    attached = [a for a in attachments if a.get("lifecycle-state") == "ATTACHED"]
+    if not attached:
+        raise RuntimeError(f"No attached VNICs found for instance {instance_id}")
+    vnic_id = attached[0]["vnic-id"]
+    private_ips = oci.run(["network", "private-ip", "list", "--vnic-id", vnic_id])["data"]
+    if not private_ips:
+        raise RuntimeError(f"No private IPs found for VNIC {vnic_id}")
+    return private_ips[0]["id"]
+
+
+def create_reserved_public_ip(
+    oci: OciCli, compartment_id: str, display_name: str, private_ip_id: str
+) -> tuple[str, str]:
+    """Create a RESERVED public IP, poll until ASSIGNED. Returns (ocid, ip_address)."""
+    created = oci.run([
+        "network", "public-ip", "create",
+        "--compartment-id", compartment_id,
+        "--display-name", display_name,
+        "--private-ip-id", private_ip_id,
+    ])["data"]
+    pub_ip_id = created["id"]
+    log(f"Reserved public IP '{display_name}' ({pub_ip_id}), waiting for ASSIGNED")
+    for _ in range(30):  # up to 5 minutes
+        data = oci.run(["network", "public-ip", "get", "--public-ip-id", pub_ip_id])["data"]
+        if data.get("lifecycle-state") == "ASSIGNED":
+            ip_address = data.get("ip-address", "")
+            log(f"Reserved IP '{display_name}': {ip_address}")
+            return pub_ip_id, ip_address
+        time.sleep(10)
+    raise RuntimeError(f"Timed out waiting for public IP {pub_ip_id} to become ASSIGNED")
+
+
+def wait_for_instance_running(
+    oci: OciCli, compartment_id: str, instance_id: str, max_wait_seconds: int = 600
+) -> None:
+    """Poll until instance is RUNNING."""
+    waited = 0
+    while waited <= max_wait_seconds:
+        instances = oci.run(["compute", "instance", "list", "--compartment-id", compartment_id])["data"]
+        for inst in instances:
+            if inst.get("id") == instance_id:
+                state = inst.get("lifecycle-state", "")
+                if state == "RUNNING":
+                    return
+                if state in {"TERMINATED", "TERMINATING"}:
+                    raise RuntimeError(f"Instance {instance_id} entered terminal state: {state}")
+                break
+        time.sleep(15)
+        waited += 15
+    raise RuntimeError(f"Timed out waiting for instance {instance_id} to become RUNNING")
+
+
+def scan_available_ads(
+    oci: OciCli,
+    tenancy_ocid: str,
+    ads: list[str],
+    shape: str,
+    shape_config: dict[str, Any] | None = None,
+) -> list[str]:
+    """Return the subset of ads where shape capacity is confirmed AVAILABLE."""
+    available = []
+    for ad in ads:
+        ok = capacity_available(oci, tenancy_ocid, ad, shape, shape_config)
+        log(f"Capacity {shape} in {ad}: {'AVAILABLE' if ok else 'unavailable'}")
+        if ok:
+            available.append(ad)
+    return available
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Provision OCI Always Free resources with retry")
     parser.add_argument("--profile", default="gf78", help="OCI config profile to use")

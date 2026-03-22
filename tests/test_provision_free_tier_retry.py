@@ -311,6 +311,49 @@ def test_oci_sdk_vnic_and_reserved_ip(monkeypatch: pytest.MonkeyPatch) -> None:
     assert get_result["data"]["ip-address"] == "10.0.0.1"
 
 
+def _make_cli_with_reserved_ip(monkeypatch: pytest.MonkeyPatch) -> Any:
+    monkeypatch.setattr(mod.oci.identity, "IdentityClient", lambda _cfg: _FakeIdentityClient())
+    monkeypatch.setattr(mod.oci.core, "VirtualNetworkClient", lambda _cfg: _FakeNetworkClientWithPrivateIp())
+    monkeypatch.setattr(mod.oci.core, "ComputeClient", lambda _cfg: _FakeComputeClientWithVnic())
+    monkeypatch.setattr(mod.oci.load_balancer, "LoadBalancerClient", lambda _cfg: _FakeLbClient())
+    monkeypatch.setattr(mod, "list_call_get_all_results", _fake_list_call_get_all_results)
+    return mod.OciCli(profile="gf78", config={"region": "eu-frankfurt-1"})
+
+
+def test_get_private_ip_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    cli = _make_cli_with_reserved_ip(monkeypatch)
+    pip_id = mod.get_private_ip_id(cli, "ocid1.compartment.oc1..x", "ocid1.instance.oc1..x")
+    assert pip_id == "ocid1.privateip.oc1..fakepip"
+
+
+def test_create_reserved_public_ip(monkeypatch: pytest.MonkeyPatch) -> None:
+    cli = _make_cli_with_reserved_ip(monkeypatch)
+    pub_ip_id, ip_addr = mod.create_reserved_public_ip(
+        cli, "ocid1.compartment.oc1..x", "ampere1-ip", "ocid1.privateip.oc1..fakepip"
+    )
+    assert pub_ip_id == "ocid1.publicip.oc1..fakepubip"
+    assert ip_addr == "10.0.0.1"
+
+
+def test_scan_available_ads_filters_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+
+    def fake_capacity_available(oci, tenancy_ocid, ad, shape, shape_config=None):
+        calls.append(ad)
+        return ad == "AD-1"
+
+    monkeypatch.setattr(mod, "capacity_available", fake_capacity_available)
+    result = mod.scan_available_ads(object(), "ocid.tenancy", ["AD-1", "AD-2", "AD-3"], "VM.Standard.A1.Flex")
+    assert result == ["AD-1"]
+    assert set(calls) == {"AD-1", "AD-2", "AD-3"}
+
+
+def test_scan_available_ads_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(mod, "capacity_available", lambda *a, **kw: False)
+    result = mod.scan_available_ads(object(), "ocid.tenancy", ["AD-1"], "VM.Standard.A1.Flex")
+    assert result == []
+
+
 def test_oci_sdk_mapping_unsupported_command(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(mod.oci.identity, "IdentityClient", lambda _cfg: _FakeIdentityClient())
     monkeypatch.setattr(mod.oci.core, "VirtualNetworkClient", lambda _cfg: _FakeNetworkClient())
