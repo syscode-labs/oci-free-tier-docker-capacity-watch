@@ -42,7 +42,7 @@ class OciCli:
     def __init__(self, profile: str, region: str | None = None, config: dict[str, Any] | None = None) -> None:
         self.profile = profile
         self.region = region
-        config_file = os.environ.get("OCI_CONFIG_FILE")
+        config_file = os.environ.get("OCI_CONFIG_FILE") or oci.config.DEFAULT_LOCATION
         self.config = config or oci.config.from_file(file_location=config_file, profile_name=profile)
         if region:
             self.config["region"] = region
