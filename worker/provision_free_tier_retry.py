@@ -897,7 +897,7 @@ def list_existing_instances(oci: OciCli, compartment_id: str, name_prefix: str, 
         inst
         for inst in instances
         if inst.get("shape") == shape
-        and inst.get("display-name", "").startswith(name_prefix)
+        and (not name_prefix or inst.get("display-name", "").startswith(name_prefix))
         and inst.get("lifecycle-state") in keep_states
     ]
 
@@ -976,7 +976,7 @@ def launch_instance(
         "--subnet-id",
         subnet_id,
         "--assign-public-ip",
-        "true",
+        "false",
         "--ssh-authorized-keys-file",
         ssh_key_file,
     ]
@@ -1067,6 +1067,123 @@ def scan_available_ads(
     return available
 
 
+def provision_account(
+    oci_cli: OciCli,
+    account: AccountState,
+    profile_defaults: dict[str, Any],
+    ads: list[str],
+    ssh_key_file: str,
+) -> bool:
+    """Run one launch cycle for a single account. Returns True when targets are met.
+
+    Mutates account.created_ampere, account.created_micro, account.subnet_id,
+    account.networking_ids, account.lb_id in place.
+    """
+    compartment_id = account.compartment_id
+    tenancy_ocid = read_profile_values(account.profile)["tenancy"]
+    prefix = f"[{account.profile}]"
+
+    # First-time networking setup
+    if account.subnet_id is None:
+        if account.existing_subnet_id:
+            account.subnet_id = account.existing_subnet_id
+            log(f"{prefix} Using existing subnet: {account.subnet_id}")
+        else:
+            vcn_id = ensure_vcn(oci_cli, compartment_id, "free-tier-vcn", "10.0.0.0/16", "freetier")
+            igw_id = ensure_igw(oci_cli, compartment_id, vcn_id, "free-tier-igw")
+            rt_id = ensure_route_table(oci_cli, compartment_id, vcn_id, igw_id, "free-tier-route-table")
+            sl_id = ensure_security_list(oci_cli, compartment_id, vcn_id, "free-tier-security-list")
+            account.subnet_id = ensure_subnet(
+                oci_cli, compartment_id, vcn_id, rt_id, sl_id,
+                "free-tier-subnet", "10.0.1.0/24", "subnet",
+            )
+            account.networking_ids = {
+                "vcn_id": vcn_id, "igw_id": igw_id,
+                "route_table_id": rt_id, "security_list_id": sl_id,
+                "subnet_id": account.subnet_id,
+            }
+
+    # First-time LB setup
+    if account.lb_id is None and account.enable_free_lb:
+        lb_id, lb_ip = ensure_free_tier_load_balancer(
+            oci=oci_cli, compartment_id=compartment_id,
+            subnet_id=account.subnet_id, display_name=account.lb_display_name,
+        )
+        account.lb_id = lb_id
+        log(f"{prefix} Load Balancer: {lb_id}" + (f" ({lb_ip})" if lb_ip else ""))
+
+    ampere_image_id = find_latest_image(oci_cli, compartment_id, "VM.Standard.A1.Flex")
+    micro_image_id = find_latest_image(oci_cli, compartment_id, "VM.Standard.E2.1.Micro")
+
+    ampere_shape_config = {
+        "ocpus": float(profile_defaults["ampere_ocpus_per_instance"]),
+        "memoryInGBs": float(profile_defaults["ampere_memory_per_instance"]),
+    }
+
+    # Scan all ADs for capacity
+    available_ampere_ads = scan_available_ads(oci_cli, tenancy_ocid, ads, "VM.Standard.A1.Flex", ampere_shape_config)
+    available_micro_ads = scan_available_ads(oci_cli, tenancy_ocid, ads, "VM.Standard.E2.1.Micro")
+
+    existing = list_existing_instances(oci_cli, compartment_id, "", "VM.Standard.A1.Flex")
+    existing_micro = list_existing_instances(oci_cli, compartment_id, "", "VM.Standard.E2.1.Micro")
+    existing_ampere_names = {i["display-name"] for i in existing}
+    existing_micro_names = {i["display-name"] for i in existing_micro}
+
+    log(f"{prefix} Existing A1: {sorted(existing_ampere_names)} / targets: {account.ampere_names}")
+    log(f"{prefix} Existing Micro: {sorted(existing_micro_names)} / targets: {account.micro_names}")
+
+    def launch_and_assign_ip(name: str, shape: str, image_id: str, boot_size: int,
+                              ad: str, shape_config: dict | None = None) -> tuple[str, str, str] | None:
+        ok, detail = launch_instance(
+            oci_cli, compartment_id=compartment_id, subnet_id=account.subnet_id,
+            ad=ad, name=name, shape=shape, image_id=image_id,
+            boot_size=boot_size, ssh_key_file=ssh_key_file, shape_config=shape_config,
+        )
+        if not ok:
+            category = classify_oci_error(detail)
+            log(f"{prefix} Launch failed for {name} [{category}]: {detail}")
+            if category not in {"capacity", "throttle", "transient"}:
+                raise RuntimeError(f"{prefix} {category} error launching {name}: {detail}")
+            return None
+        instance_id = detail
+        log(f"{prefix} Launched {name} ({instance_id}) in {ad} — waiting for RUNNING")
+        wait_for_instance_running(oci_cli, compartment_id, instance_id)
+        pip_id_val = get_private_ip_id(oci_cli, compartment_id, instance_id)
+        pub_ip_id, pub_ip = create_reserved_public_ip(oci_cli, compartment_id, f"{name}-ip", pip_id_val)
+        log(f"{prefix} {name}: instance={instance_id} ip={pub_ip}")
+        return name, instance_id, pub_ip_id
+
+    # Launch missing Micro
+    created_names_micro = {n for n, _, _ in account.created_micro}
+    for idx, name in enumerate(n for n in account.micro_names if n not in existing_micro_names | created_names_micro):
+        if not available_micro_ads:
+            log(f"{prefix} No ADs with Micro capacity this cycle")
+            break
+        ad = available_micro_ads[idx % len(available_micro_ads)]
+        result = launch_and_assign_ip(name, "VM.Standard.E2.1.Micro", micro_image_id,
+                                       int(profile_defaults["micro_boot_volume_size"]), ad)
+        if result:
+            account.created_micro.append(result)
+
+    # Launch missing Ampere
+    created_names_ampere = {n for n, _, _ in account.created_ampere}
+    for idx, name in enumerate(n for n in account.ampere_names if n not in existing_ampere_names | created_names_ampere):
+        if not available_ampere_ads:
+            log(f"{prefix} No ADs with Ampere capacity this cycle")
+            break
+        ad = available_ampere_ads[idx % len(available_ampere_ads)]
+        result = launch_and_assign_ip(name, "VM.Standard.A1.Flex", ampere_image_id,
+                                       int(profile_defaults["ampere_boot_volume_size"]), ad,
+                                       shape_config=ampere_shape_config)
+        if result:
+            account.created_ampere.append(result)
+
+    # Check completion
+    all_ampere = existing_ampere_names | {n for n, _, _ in account.created_ampere}
+    all_micro = existing_micro_names | {n for n, _, _ in account.created_micro}
+    return all(n in all_ampere for n in account.ampere_names) and all(n in all_micro for n in account.micro_names)
+
+
 def generate_import_report(
     *,
     output_path: Path,
@@ -1112,174 +1229,73 @@ def generate_import_report(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Provision OCI Always Free resources with retry")
-    parser.add_argument("--profile", default="gf78", help="OCI config profile to use")
-    parser.add_argument("--compartment-name", default="gf78-free-tier-dedicated", help="Dedicated compartment name")
-    parser.add_argument("--region", default="", help="OCI region override (default: from profile)")
-    parser.add_argument("--ssh-key-file", default=str(Path.home() / ".ssh" / "id_rsa.pub"))
-    parser.add_argument("--retry-seconds", type=int, default=300, help="Seconds between capacity retry cycles")
-    parser.add_argument("--max-attempts", type=int, default=0, help="0 = retry forever, otherwise stop after N cycles")
+    parser = argparse.ArgumentParser(description="Provision OCI Always Free resources across multiple accounts")
+    parser.add_argument(
+        "--accounts-file",
+        default=os.environ.get("ACCOUNTS_FILE", "/app/config/accounts.json"),
+        help="JSON file listing OCI accounts to provision",
+    )
     parser.add_argument(
         "--profile-defaults-file",
         default=os.environ.get("PROFILE_DEFAULTS_FILE", "/app/config/profile.defaults.json"),
-        help="JSON file containing compute/LB defaults",
+        help="JSON file with shared compute defaults",
     )
+    parser.add_argument("--ssh-key-file", default=str(Path.home() / ".ssh" / "id_rsa.pub"))
+    parser.add_argument("--retry-seconds", type=int, default=300, help="Seconds between cycles")
+    parser.add_argument("--max-attempts", type=int, default=0, help="0 = retry forever")
     args = parser.parse_args()
 
-    profile_values = read_profile_values(args.profile)
-    region = args.region or profile_values["region"]
-    oci = OciCli(profile=args.profile, region=region)
-
+    profile_defaults = load_profile_defaults(Path(args.profile_defaults_file))
+    accounts = load_accounts(Path(args.accounts_file), profile_defaults)
     ssh_key_file = resolve_ssh_public_key(args.ssh_key_file)
 
-    profile_defaults = load_profile_defaults(Path(args.profile_defaults_file))
-    ampere_target = int(profile_defaults["ampere_instance_count"])
-    micro_target = int(profile_defaults["micro_instance_count"])
+    log(f"Loaded {len(accounts)} account(s): {[a.profile for a in accounts]}")
 
-    log(f"Profile={args.profile} Region={region}")
-    log(
-        "VM profile from profile defaults: "
-        f"ampere={ampere_target} ({profile_defaults['ampere_ocpus_per_instance']} OCPU/{profile_defaults['ampere_memory_per_instance']}GB each), "
-        f"micro={micro_target}"
-    )
-
-    tenancy_ocid = profile_values["tenancy"]
-    compartment_id = ensure_compartment(oci, tenancy_ocid, args.compartment_name)
-
-    vcn_id = ensure_vcn(
-        oci,
-        compartment_id,
-        name="free-tier-vcn",
-        cidr="10.0.0.0/16",
-        dns_label="freetier",
-    )
-    igw_id = ensure_igw(oci, compartment_id, vcn_id, "free-tier-igw")
-    route_table_id = ensure_route_table(oci, compartment_id, vcn_id, igw_id, "free-tier-route-table")
-    security_list_id = ensure_security_list(oci, compartment_id, vcn_id, "free-tier-security-list")
-    subnet_id = ensure_subnet(
-        oci,
-        compartment_id,
-        vcn_id,
-        route_table_id,
-        security_list_id,
-        name="free-tier-subnet",
-        cidr="10.0.1.0/24",
-        dns_label="subnet",
-    )
-    enable_free_lb = parse_bool(profile_defaults["enable_free_lb"])
-    if enable_free_lb:
-        lb_id, lb_ip = ensure_free_tier_load_balancer(
-            oci=oci,
-            compartment_id=compartment_id,
-            subnet_id=subnet_id,
-            display_name=str(profile_defaults["lb_display_name"]),
-        )
-        log(f"Load Balancer: {lb_id}")
-        if lb_ip:
-            log(f"Load Balancer public IP: {lb_ip}")
-
-    ads = get_availability_domains(oci, tenancy_ocid)
-    if not ads:
-        raise RuntimeError("No availability domains returned")
-
-    ampere_image_id = find_latest_image(oci, compartment_id, "VM.Standard.A1.Flex")
-    micro_image_id = find_latest_image(oci, compartment_id, "VM.Standard.E2.1.Micro")
-
-    log(f"A1 image: {ampere_image_id}")
-    log(f"Micro image: {micro_image_id}")
+    # Build one OciCli per account (each has its own profile/region)
+    clients: dict[str, OciCli] = {}
+    ads_by_profile: dict[str, list[str]] = {}
+    for account in accounts:
+        pv = read_profile_values(account.profile)
+        cli = OciCli(profile=account.profile, region=pv["region"])
+        clients[account.profile] = cli
+        ads_by_profile[account.profile] = get_availability_domains(cli, pv["tenancy"])
+        log(f"[{account.profile}] ADs: {', '.join(ads_by_profile[account.profile])}")
 
     attempt = 0
     while True:
         attempt += 1
-        log(f"Launch cycle #{attempt}")
+        pending = [a for a in accounts if not a.done]
+        log(f"--- Cycle #{attempt} — {len(pending)} account(s) pending ---")
 
-        existing_ampere = list_existing_instances(oci, compartment_id, "ampere-instance-", "VM.Standard.A1.Flex")
-        existing_micro = list_existing_instances(oci, compartment_id, "micro-instance-", "VM.Standard.E2.1.Micro")
+        for account in pending:
+            cli = clients[account.profile]
+            ads = ads_by_profile[account.profile]
+            log(f"[{account.profile}] Starting provision attempt")
+            try:
+                done = provision_account(cli, account, profile_defaults, ads, ssh_key_file)
+            except RuntimeError as exc:
+                log(f"[{account.profile}] Fatal error: {exc}")
+                return 1
+            if done:
+                log(f"[{account.profile}] Targets satisfied — writing import report")
+                generate_import_report(
+                    output_path=account.report_output,
+                    networking=account.networking_ids,
+                    lb_id=account.lb_id,
+                    ampere_instances=account.created_ampere,
+                    micro_instances=account.created_micro,
+                )
+                account.done = True
 
-        log(f"Existing A1 instances: {len(existing_ampere)}/{ampere_target}")
-        log(f"Existing Micro instances: {len(existing_micro)}/{micro_target}")
-
-        for idx in range(len(existing_micro), micro_target):
-            name = f"micro-instance-{idx + 1}"
-            ad = ads[0]
-            if not capacity_available(
-                oci=oci,
-                tenancy_ocid=tenancy_ocid,
-                availability_domain=ad,
-                shape="VM.Standard.E2.1.Micro",
-            ):
-                log(f"Capacity unavailable for VM.Standard.E2.1.Micro in {ad}, skipping launch for now")
-                continue
-            ok, detail = launch_instance(
-                oci,
-                compartment_id=compartment_id,
-                subnet_id=subnet_id,
-                ad=ad,
-                name=name,
-                shape="VM.Standard.E2.1.Micro",
-                image_id=micro_image_id,
-                boot_size=int(profile_defaults["micro_boot_volume_size"]),
-                ssh_key_file=ssh_key_file,
-            )
-            if ok:
-                log(f"Launched {name}: {detail}")
-            else:
-                category = classify_oci_error(detail)
-                log(f"Launch failed for {name} [{category}]: {detail}")
-                if category not in {"capacity", "throttle", "transient"}:
-                    raise RuntimeError(f"{category} error launching {name}: {detail}")
-
-        for idx in range(len(existing_ampere), ampere_target):
-            name = f"ampere-instance-{idx + 1}"
-            ad = ads[idx % len(ads)]
-            shape_config = {
-                "ocpus": float(profile_defaults["ampere_ocpus_per_instance"]),
-                "memoryInGBs": float(profile_defaults["ampere_memory_per_instance"]),
-            }
-            if not capacity_available(
-                oci=oci,
-                tenancy_ocid=tenancy_ocid,
-                availability_domain=ad,
-                shape="VM.Standard.A1.Flex",
-                shape_config=shape_config,
-            ):
-                log(f"Capacity unavailable for VM.Standard.A1.Flex in {ad}, skipping launch for now")
-                continue
-            ok, detail = launch_instance(
-                oci,
-                compartment_id=compartment_id,
-                subnet_id=subnet_id,
-                ad=ad,
-                name=name,
-                shape="VM.Standard.A1.Flex",
-                image_id=ampere_image_id,
-                boot_size=int(profile_defaults["ampere_boot_volume_size"]),
-                ssh_key_file=ssh_key_file,
-                shape_config=shape_config,
-            )
-            if ok:
-                log(f"Launched {name}: {detail}")
-            else:
-                category = classify_oci_error(detail)
-                log(f"Launch failed for {name} [{category}]: {detail}")
-                if category not in {"capacity", "throttle", "transient"}:
-                    raise RuntimeError(f"{category} error launching {name}: {detail}")
-
-        existing_ampere = list_existing_instances(oci, compartment_id, "ampere-instance-", "VM.Standard.A1.Flex")
-        existing_micro = list_existing_instances(oci, compartment_id, "micro-instance-", "VM.Standard.E2.1.Micro")
-
-        if len(existing_ampere) >= ampere_target and len(existing_micro) >= micro_target:
-            log("Target profile satisfied. Provisioning complete.")
-            log(f"Compartment: {compartment_id}")
-            log(f"VCN: {vcn_id}")
-            log(f"Subnet: {subnet_id}")
+        if all(a.done for a in accounts):
+            log("All accounts satisfied. Done.")
             return 0
 
         if args.max_attempts > 0 and attempt >= args.max_attempts:
-            log("Reached max attempts before satisfying target profile.")
+            log("Reached max attempts.")
             return 2
 
-        log(f"Capacity not yet sufficient. Sleeping {args.retry_seconds}s before next cycle...")
+        log(f"Sleeping {args.retry_seconds}s before next cycle...")
         time.sleep(args.retry_seconds)
 
 
