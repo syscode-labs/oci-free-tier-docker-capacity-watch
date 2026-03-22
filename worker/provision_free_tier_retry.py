@@ -176,6 +176,7 @@ class OciCli:
                     compartment_id=self._require_flag(args, "--compartment-id"),
                     name=self._require_flag(args, "--name"),
                     description=self._require_flag(args, "--description"),
+                    email=self._flag(args, "--email"),
                 )
                 return self._data(self.identity_client.create_user(details).data)
             if command == ("iam", "group-membership", "create"):
@@ -570,6 +571,7 @@ class AccountState:
     create_compartment: bool = False
     compartment_name: str | None = None
     iam_api_public_key: str | None = None
+    iam_user_email: str | None = None  # required for IDCS-federated tenancies
     # optional report push (GitHub)
     report_push_github_repo: str | None = None    # e.g. "org/infra-private"
     report_push_github_path: str | None = None    # e.g. "oci/profile-import.tf"
@@ -625,6 +627,7 @@ def load_accounts(path: Path, defaults: dict[str, Any]) -> list[AccountState]:
             create_compartment=create_compartment,
             compartment_name=compartment_name,
             iam_api_public_key=entry.get("iam_api_public_key"),
+            iam_user_email=entry.get("iam_user_email"),
             report_push_github_repo=push.get("github_repo"),
             report_push_github_path=push.get("github_path"),
             report_push_github_branch=push.get("github_branch", "main"),
@@ -1223,11 +1226,13 @@ def ensure_iam_setup(oci_cli: OciCli, account: AccountState, tenancy_id: str) ->
         user_id = existing_users[0]["id"]
         log(f"{prefix} IAM user '{user_name}' already exists")
     else:
+        email = account.iam_user_email or f"{user_name}@noreply.oci.local"
         result = oci_cli.run([
             "iam", "user", "create",
             "--compartment-id", tenancy_id,
             "--name", user_name,
             "--description", f"Service user for {name} compartment",
+            "--email", email,
         ])["data"]
         user_id = result["id"]
         log(f"{prefix} Created IAM user '{user_name}': {user_id}")
