@@ -354,6 +354,45 @@ def test_scan_available_ads_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result == []
 
 
+def test_generate_import_report(tmp_path: Path) -> None:
+    output_path = tmp_path / "imports.tf"
+    mod.generate_import_report(
+        output_path=output_path,
+        networking={
+            "vcn_id": "ocid1.vcn.x",
+            "igw_id": "ocid1.igw.x",
+            "route_table_id": "ocid1.rt.x",
+            "security_list_id": "ocid1.sl.x",
+            "subnet_id": "ocid1.subnet.x",
+        },
+        lb_id="ocid1.lb.x",
+        ampere_instances=[("ampere1", "ocid1.instance.a1", "ocid1.pip.a1")],
+        micro_instances=[("micro1", "ocid1.instance.m1", "ocid1.pip.m1")],
+    )
+    content = output_path.read_text(encoding="utf-8")
+    assert "to = oci_core_vcn.free_tier_vcn[0]" in content
+    assert 'id = "ocid1.vcn.x"' in content
+    assert "to = oci_core_instance.ampere_instance[0]" in content
+    assert "to = oci_core_public_ip.ampere_instance[0]" in content
+    assert "to = oci_core_instance.micro_instance[0]" in content
+    assert "to = oci_load_balancer_load_balancer.free_tier_lb[0]" in content
+
+
+def test_generate_import_report_skips_none(tmp_path: Path) -> None:
+    output_path = tmp_path / "imports.tf"
+    mod.generate_import_report(
+        output_path=output_path,
+        networking=None,
+        lb_id=None,
+        ampere_instances=[("ampere1", "ocid1.instance.a1", "ocid1.pip.a1")],
+        micro_instances=[],
+    )
+    content = output_path.read_text(encoding="utf-8")
+    assert "oci_core_vcn" not in content
+    assert "oci_load_balancer" not in content
+    assert "ampere_instance[0]" in content
+
+
 def test_oci_sdk_mapping_unsupported_command(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(mod.oci.identity, "IdentityClient", lambda _cfg: _FakeIdentityClient())
     monkeypatch.setattr(mod.oci.core, "VirtualNetworkClient", lambda _cfg: _FakeNetworkClient())
