@@ -266,6 +266,27 @@ class OciCli:
                     security_list_ids=json.loads(self._require_flag(args, "--security-list-ids")),
                 )
                 return self._data(self.network_client.create_subnet(details).data)
+            if command == ("network", "private-ip", "list"):
+                return self._list_all(
+                    self.network_client.list_private_ips,
+                    vnic_id=self._flag(args, "--vnic-id"),
+                    subnet_id=self._flag(args, "--subnet-id"),
+                    ip_address=self._flag(args, "--ip-address"),
+                )
+            if command == ("network", "public-ip", "create"):
+                details = oci.core.models.CreatePublicIpDetails(
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                    lifetime="RESERVED",
+                    display_name=self._require_flag(args, "--display-name"),
+                    private_ip_id=self._require_flag(args, "--private-ip-id"),
+                )
+                return self._data(self.network_client.create_public_ip(details).data)
+            if command == ("network", "public-ip", "get"):
+                return self._data(
+                    self.network_client.get_public_ip(
+                        public_ip_id=self._require_flag(args, "--public-ip-id")
+                    ).data
+                )
             if command == ("lb", "load-balancer", "get"):
                 return self._data(
                     self.lb_client.get_load_balancer(
@@ -294,6 +315,12 @@ class OciCli:
                 return self._list_all(
                     self.compute_client.list_instances,
                     compartment_id=self._require_flag(args, "--compartment-id"),
+                )
+            if command == ("compute", "vnic-attachment", "list"):
+                return self._list_all(
+                    self.compute_client.list_vnic_attachments,
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                    instance_id=self._flag(args, "--instance-id"),
                 )
             if command == ("compute", "compute-capacity-report", "create"):
                 shape_availabilities_raw = json.loads(self._require_flag(args, "--shape-availabilities"))

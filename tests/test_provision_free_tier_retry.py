@@ -239,6 +239,78 @@ def test_load_accounts_rejects_empty_list(tmp_path: Path) -> None:
         mod.load_accounts(accounts_file, _minimal_defaults())
 
 
+_FAKE_VNIC_ATTACHMENT = {
+    "vnic_id": "ocid1.vnic.oc1..fakevnic",
+    "lifecycle_state": "ATTACHED",
+}
+
+_FAKE_PRIVATE_IP = {
+    "id": "ocid1.privateip.oc1..fakepip",
+}
+
+_FAKE_PUBLIC_IP = {
+    "id": "ocid1.publicip.oc1..fakepubip",
+    "ip_address": "10.0.0.1",
+    "lifecycle_state": "ASSIGNED",
+}
+
+
+class _FakeComputeClientWithVnic(_FakeComputeClient):
+    def list_vnic_attachments(self, **kwargs):
+        return SimpleNamespace(data=[_FAKE_VNIC_ATTACHMENT])
+
+
+class _FakeNetworkClientWithPrivateIp(_FakeNetworkClient):
+    def list_private_ips(self, **kwargs):
+        return SimpleNamespace(data=[_FAKE_PRIVATE_IP])
+
+    def create_public_ip(self, details):
+        assert details.lifetime == "RESERVED"
+        assert details.private_ip_id == "ocid1.privateip.oc1..fakepip"
+        return SimpleNamespace(data=_FAKE_PUBLIC_IP)
+
+    def get_public_ip(self, public_ip_id):
+        assert public_ip_id == "ocid1.publicip.oc1..fakepubip"
+        return SimpleNamespace(data=_FAKE_PUBLIC_IP)
+
+
+def test_oci_sdk_vnic_and_reserved_ip(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(mod.oci.identity, "IdentityClient", lambda _cfg: _FakeIdentityClient())
+    monkeypatch.setattr(mod.oci.core, "VirtualNetworkClient", lambda _cfg: _FakeNetworkClientWithPrivateIp())
+    monkeypatch.setattr(mod.oci.core, "ComputeClient", lambda _cfg: _FakeComputeClientWithVnic())
+    monkeypatch.setattr(mod.oci.load_balancer, "LoadBalancerClient", lambda _cfg: _FakeLbClient())
+    monkeypatch.setattr(mod, "list_call_get_all_results", _fake_list_call_get_all_results)
+
+    cli = mod.OciCli(profile="gf78", config={"region": "eu-frankfurt-1"})
+
+    vnic_result = cli.run([
+        "compute", "vnic-attachment", "list",
+        "--compartment-id", "ocid1.compartment.oc1..x",
+        "--instance-id", "ocid1.instance.oc1..x",
+    ])
+    assert vnic_result["data"][0]["vnic-id"] == "ocid1.vnic.oc1..fakevnic"
+
+    pip_result = cli.run([
+        "network", "private-ip", "list",
+        "--vnic-id", "ocid1.vnic.oc1..fakevnic",
+    ])
+    assert pip_result["data"][0]["id"] == "ocid1.privateip.oc1..fakepip"
+
+    pub_result = cli.run([
+        "network", "public-ip", "create",
+        "--compartment-id", "ocid1.compartment.oc1..x",
+        "--display-name", "ampere1-ip",
+        "--private-ip-id", "ocid1.privateip.oc1..fakepip",
+    ])
+    assert pub_result["data"]["id"] == "ocid1.publicip.oc1..fakepubip"
+
+    get_result = cli.run([
+        "network", "public-ip", "get",
+        "--public-ip-id", "ocid1.publicip.oc1..fakepubip",
+    ])
+    assert get_result["data"]["ip-address"] == "10.0.0.1"
+
+
 def test_oci_sdk_mapping_unsupported_command(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(mod.oci.identity, "IdentityClient", lambda _cfg: _FakeIdentityClient())
     monkeypatch.setattr(mod.oci.core, "VirtualNetworkClient", lambda _cfg: _FakeNetworkClient())
