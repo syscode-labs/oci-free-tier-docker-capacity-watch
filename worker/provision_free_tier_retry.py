@@ -1226,7 +1226,7 @@ def ensure_iam_setup(oci_cli: OciCli, account: AccountState, tenancy_id: str) ->
         user_id = existing_users[0]["id"]
         log(f"{prefix} IAM user '{user_name}' already exists")
     else:
-        email = account.iam_user_email or f"{user_name}@noreply.oci.local"
+        email = account.iam_user_email or f"{user_name}@noreply.example.com"
         result = oci_cli.run([
             "iam", "user", "create",
             "--compartment-id", tenancy_id,
