@@ -141,7 +141,7 @@ class OciCli:
                     self.identity_client.list_compartments,
                     compartment_id=self._require_flag(args, "--compartment-id"),
                     name=self._flag(args, "--name"),
-                    access_level=self._flag(args, "--access-level"),
+                    access_level=self._flag(args, "--access-level") or "ANY",
                     compartment_id_in_subtree=self._to_bool(self._flag(args, "--compartment-id-in-subtree")),
                     lifecycle_state=self._flag(args, "--lifecycle-state"),
                 )
