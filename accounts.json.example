@@ -1,0 +1,18 @@
+[
+  {
+    "profile": "fonderiadigitale",
+    "compartment_id": "ocid1.compartment.oc1..REPLACE",
+    "existing_subnet_id": "ocid1.subnet.oc1..REPLACE",
+    "report_output": "./state/fonderiadigitale-import.tf",
+    "ampere_node_names": ["ampere1", "ampere2", "ampere3"],
+    "micro_node_names": ["micro1"],
+    "enable_free_lb": false
+  },
+  {
+    "profile": "syscode-homelab",
+    "compartment_id": "ocid1.compartment.oc1..REPLACE",
+    "report_output": "./state/syscode-import.tf",
+    "ampere_node_names": ["oci-talos-cp-1", "oci-talos-cp-2", "oci-talos-cp-3", "oci-talos-worker-1"],
+    "micro_node_names": []
+  }
+]

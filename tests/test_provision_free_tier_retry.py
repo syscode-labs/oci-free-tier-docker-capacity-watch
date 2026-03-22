@@ -169,6 +169,76 @@ def test_load_profile_defaults_rejects_old_schema(tmp_path: Path) -> None:
         mod.load_profile_defaults(defaults)
 
 
+def _minimal_defaults() -> dict[str, Any]:
+    return {
+        "ampere_node_names": ["ampere1"],
+        "ampere_ocpus_per_instance": 1,
+        "ampere_memory_per_instance": 6,
+        "ampere_boot_volume_size": 50,
+        "micro_node_names": ["micro1"],
+        "micro_boot_volume_size": 50,
+        "enable_free_lb": True,
+        "lb_display_name": "free-tier-lb",
+    }
+
+
+def test_load_accounts_minimal(tmp_path: Path) -> None:
+    accounts_file = tmp_path / "accounts.json"
+    accounts_file.write_text(
+        json.dumps([{
+            "profile": "myprofile",
+            "compartment_id": "ocid1.compartment.oc1..abc",
+        }]),
+        encoding="utf-8",
+    )
+    states = mod.load_accounts(accounts_file, _minimal_defaults())
+    assert len(states) == 1
+    s = states[0]
+    assert s.profile == "myprofile"
+    assert s.compartment_id == "ocid1.compartment.oc1..abc"
+    assert s.existing_subnet_id is None
+    assert s.report_output == Path("./state/myprofile-import.tf")
+    assert s.ampere_names == ["ampere1"]  # fallback from defaults
+    assert s.enable_free_lb is True       # fallback from defaults
+
+
+def test_load_accounts_per_account_override(tmp_path: Path) -> None:
+    accounts_file = tmp_path / "accounts.json"
+    accounts_file.write_text(
+        json.dumps([{
+            "profile": "p1",
+            "compartment_id": "ocid1.compartment.oc1..x",
+            "existing_subnet_id": "ocid1.subnet.oc1..y",
+            "report_output": "/tmp/p1-import.tf",
+            "ampere_node_names": ["cp-1", "cp-2"],
+            "micro_node_names": [],
+            "enable_free_lb": False,
+        }]),
+        encoding="utf-8",
+    )
+    states = mod.load_accounts(accounts_file, _minimal_defaults())
+    s = states[0]
+    assert s.existing_subnet_id == "ocid1.subnet.oc1..y"
+    assert s.report_output == Path("/tmp/p1-import.tf")
+    assert s.ampere_names == ["cp-1", "cp-2"]
+    assert s.micro_names == []
+    assert s.enable_free_lb is False
+
+
+def test_load_accounts_requires_profile_and_compartment(tmp_path: Path) -> None:
+    accounts_file = tmp_path / "accounts.json"
+    accounts_file.write_text(json.dumps([{"profile": "p1"}]), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="compartment_id"):
+        mod.load_accounts(accounts_file, _minimal_defaults())
+
+
+def test_load_accounts_rejects_empty_list(tmp_path: Path) -> None:
+    accounts_file = tmp_path / "accounts.json"
+    accounts_file.write_text("[]", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="at least one account"):
+        mod.load_accounts(accounts_file, _minimal_defaults())
+
+
 def test_oci_sdk_mapping_unsupported_command(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(mod.oci.identity, "IdentityClient", lambda _cfg: _FakeIdentityClient())
     monkeypatch.setattr(mod.oci.core, "VirtualNetworkClient", lambda _cfg: _FakeNetworkClient())

@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
 import math
 from pathlib import Path
@@ -461,6 +462,54 @@ def load_profile_defaults(path: Path) -> dict[str, Any]:
         raise RuntimeError("Profile key 'lb_display_name' must be a non-empty string")
 
     return data
+
+
+@dataclass
+class AccountState:
+    profile: str
+    compartment_id: str
+    existing_subnet_id: str | None
+    report_output: Path
+    ampere_names: list[str]
+    micro_names: list[str]
+    enable_free_lb: bool
+    lb_display_name: str
+    # mutable per-run tracking
+    done: bool = False
+    created_ampere: list[tuple[str, str, str]] = field(default_factory=list)  # (name, instance_id, pip_id)
+    created_micro: list[tuple[str, str, str]] = field(default_factory=list)
+    networking_ids: dict[str, str] | None = None
+    lb_id: str | None = None
+    subnet_id: str | None = None
+
+
+def load_accounts(path: Path, defaults: dict[str, Any]) -> list[AccountState]:
+    """Load accounts.json and merge with profile defaults."""
+    entries = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(entries, list) or len(entries) == 0:
+        raise RuntimeError(f"accounts file '{path}' must contain at least one account")
+
+    states: list[AccountState] = []
+    for i, entry in enumerate(entries):
+        profile = entry.get("profile")
+        compartment_id = entry.get("compartment_id")
+        if not profile:
+            raise RuntimeError(f"accounts[{i}] missing required key 'profile'")
+        if not compartment_id:
+            raise RuntimeError(f"accounts[{i}] missing required key 'compartment_id'")
+
+        report_output = entry.get("report_output", f"./state/{profile}-import.tf")
+        states.append(AccountState(
+            profile=profile,
+            compartment_id=compartment_id,
+            existing_subnet_id=entry.get("existing_subnet_id"),
+            report_output=Path(report_output),
+            ampere_names=entry.get("ampere_node_names", defaults["ampere_node_names"]),
+            micro_names=entry.get("micro_node_names", defaults["micro_node_names"]),
+            enable_free_lb=entry.get("enable_free_lb", defaults["enable_free_lb"]),
+            lb_display_name=entry.get("lb_display_name", defaults["lb_display_name"]),
+        ))
+    return states
 
 
 def resolve_ssh_public_key(path_value: str) -> str:
