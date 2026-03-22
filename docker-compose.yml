@@ -5,23 +5,18 @@ services:
     restart: unless-stopped
     user: ${CONTAINER_USER:-0}
     environment:
-      OCI_PROFILE: ${OCI_PROFILE}
-      OCI_CONFIG_FILE: /run/oci/config
-      COMPARTMENT_NAME: ${COMPARTMENT_NAME:-oci-free-tier-dedicated}
-      RETRY_SECONDS: ${RETRY_SECONDS:-300}
-      MAX_ATTEMPTS: ${MAX_ATTEMPTS:-0}
+      OCI_CONFIG_FILE: /root/.oci/config
+      ACCOUNTS_FILE: /app/config/accounts.json
       PROFILE_DEFAULTS_FILE: /app/config/profile.defaults.json
-      SSH_KEY_FILE: /run/keys/ssh_public_key.pub
-      STATE_DIR: /state
-      NOTIFY_BACKEND: ${NOTIFY_BACKEND:-none}
-      NOTIFY_WEBHOOK_URL: ${NOTIFY_WEBHOOK_URL:-}
-      UNRAID_NOTIFY_CMD: /usr/local/bin/unraid-notify
+    command:
+      - --accounts-file=/app/config/accounts.json
+      - --profile-defaults-file=/app/config/profile.defaults.json
+      - --retry-seconds=${RETRY_SECONDS:-300}
     volumes:
-      - ${OCI_MOUNT_DIR}:/run/oci:ro
-      - ${SSH_PUBLIC_KEY_FILE}:/run/keys/ssh_public_key.pub:ro
-      - ${PROFILE_DEFAULTS_FILE}:/app/config/profile.defaults.json:ro
-      - ./state:/state
-      - ${UNRAID_NOTIFY_BIN:-/dev/null}:/usr/local/bin/unraid-notify:ro
+      - ${OCI_CONFIG_DIR:-~/.oci}:/root/.oci:ro
+      - ${SSH_KEY_FILE:-~/.ssh/id_rsa.pub}:/root/.ssh/id_rsa.pub:ro
+      - ./config:/app/config:ro
+      - ./state:/app/state
     read_only: true
     tmpfs:
       - /tmp

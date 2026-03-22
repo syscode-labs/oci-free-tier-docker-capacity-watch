@@ -1,45 +1,44 @@
 # Quickstart
 
-## 1) Prepare env
+## 1) Configure accounts
+
+Copy the example accounts file and fill in your OCI details:
 
 ```bash
-mise trust
-mise env-gen
-# or: make env-gen
+cp accounts.json.example config/accounts.json
 ```
 
-Edit `.env`:
+Edit `config/accounts.json`:
 
-- `OCI_PROFILE` to your profile name in mounted `.oci/config`
-- `WATCHER_IMAGE` to the image tag you want (default points to GHCR release)
-- `CONTAINER_USER`:
-  - default `1000:1000` is recommended for Unraid/userns setups
-  - if credentials are unreadable, adjust uid:gid to match mounted file ownership
-- `OCI_MOUNT_DIR` to host directory containing `.oci/config` and key files
-- `SSH_PUBLIC_KEY_FILE` to host public key path
-- `PROFILE_DEFAULTS_FILE` to host path for the shared profile JSON
-  (default file in repo: `profile.defaults.json`)
-- `NOTIFY_BACKEND` and optional notification settings
+- Set each `profile` to match an OCI config profile in your `~/.oci/config`
+- Set each `compartment_id` to the OCID of the compartment to provision into
+- Set `existing_subnet_id` if you want to use a pre-existing subnet (skips VCN/networking creation)
+- Override `ampere_node_names` / `micro_node_names` per account if needed
+- Set `report_output` to where the import report should be written (default: `./state/<profile>-import.tf`)
 
-For Unraid notification support:
-
-- set `NOTIFY_BACKEND=unraid`
-- set `UNRAID_NOTIFY_BIN=/usr/local/emhttp/webGui/scripts/notify`
-
-Optional local validation:
+Copy or edit the shared compute defaults:
 
 ```bash
-mise env-check
-# or: make env-check
+cp profile.defaults.json config/profile.defaults.json
 ```
 
-## 2) Start watcher
+Edit `config/profile.defaults.json` to set OCPU/memory/boot size per instance type.
+
+## 2) Set environment variables
+
+```bash
+export OCI_CONFIG_DIR=~/.oci     # directory containing your OCI config and key files
+export SSH_KEY_FILE=~/.ssh/id_rsa.pub
+export RETRY_SECONDS=300         # optional, default 300
+```
+
+## 3) Start watcher
 
 ```bash
 docker compose up -d
 ```
 
-## 3) Check logs
+## 4) Check logs
 
 ```bash
 docker compose logs -f watcher
@@ -47,16 +46,29 @@ docker compose logs -f watcher
 
 Look for:
 
-- `Launch cycle #...`
-- `Capacity unavailable ...` (normal while waiting)
-- `Target profile satisfied. Provisioning complete.`
+- `--- Cycle #... ---` — each provisioning cycle
+- `Capacity VM.Standard.A1.Flex in AD-X: unavailable` — normal while waiting
+- `[profile] Targets satisfied — writing import report` — account done
 
-## 4) Stop
+## 5) Import into tofu state
+
+When all accounts are satisfied, import reports appear in `./state/`:
+
+```
+state/fonderiadigitale-import.tf
+state/syscode-homelab-import.tf
+```
+
+Drop each report into `syscode-infra-private/oci/` and run:
+
+```bash
+tofu apply -var-file=oci/<account>.tfvars -chdir=module/tofu/oci
+```
+
+## 6) Stop
 
 ```bash
 docker compose down
 ```
 
-## 5) Autostart on reboot
-
-Container restart policy is already `unless-stopped`.
+Container restart policy is `unless-stopped` — it will resume on reboot.
