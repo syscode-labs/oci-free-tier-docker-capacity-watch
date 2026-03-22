@@ -429,47 +429,35 @@ def parse_bool(value: str | bool) -> bool:
 def load_profile_defaults(path: Path) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
     required = [
-        "ampere_instance_count",
+        "ampere_node_names",
         "ampere_ocpus_per_instance",
         "ampere_memory_per_instance",
         "ampere_boot_volume_size",
-        "micro_instance_count",
+        "micro_node_names",
         "micro_boot_volume_size",
         "enable_free_lb",
         "lb_display_name",
     ]
     missing = [k for k in required if k not in data]
     if missing:
-        raise RuntimeError(
-            f"Profile defaults file '{path}' missing keys: {', '.join(missing)}"
-        )
-    int_keys = [
-        "ampere_instance_count",
-        "ampere_boot_volume_size",
-        "micro_instance_count",
-        "micro_boot_volume_size",
-    ]
-    for key in int_keys:
-        value = data[key]
-        if not isinstance(value, int):
-            raise RuntimeError(f"Profile key '{key}' must be an integer, got {type(value).__name__}")
-        if value < 0:
-            raise RuntimeError(f"Profile key '{key}' must be >= 0")
+        raise RuntimeError(f"Profile defaults file '{path}' missing keys: {', '.join(missing)}")
 
-    float_keys = ["ampere_ocpus_per_instance", "ampere_memory_per_instance"]
-    for key in float_keys:
-        value = data[key]
-        if not isinstance(value, (int, float)):
-            raise RuntimeError(f"Profile key '{key}' must be numeric, got {type(value).__name__}")
-        if float(value) <= 0:
-            raise RuntimeError(f"Profile key '{key}' must be > 0")
+    for key in ("ampere_node_names", "micro_node_names"):
+        if not isinstance(data[key], list) or not all(isinstance(n, str) for n in data[key]):
+            raise RuntimeError(f"Profile key '{key}' must be a list of strings")
 
-    lb_enabled = data["enable_free_lb"]
-    if not isinstance(lb_enabled, bool):
+    for key in ("ampere_boot_volume_size", "micro_boot_volume_size"):
+        if not isinstance(data[key], int) or data[key] <= 0:
+            raise RuntimeError(f"Profile key '{key}' must be a positive integer")
+
+    for key in ("ampere_ocpus_per_instance", "ampere_memory_per_instance"):
+        if not isinstance(data[key], (int, float)) or float(data[key]) <= 0:
+            raise RuntimeError(f"Profile key '{key}' must be a positive number")
+
+    if not isinstance(data["enable_free_lb"], bool):
         raise RuntimeError("Profile key 'enable_free_lb' must be true/false")
 
-    lb_name = data["lb_display_name"]
-    if not isinstance(lb_name, str) or lb_name.strip() == "":
+    if not isinstance(data["lb_display_name"], str) or not data["lb_display_name"].strip():
         raise RuntimeError("Profile key 'lb_display_name' must be a non-empty string")
 
     return data

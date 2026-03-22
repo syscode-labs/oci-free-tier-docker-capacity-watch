@@ -1,9 +1,9 @@
 {
-  "ampere_instance_count": 3,
-  "ampere_ocpus_per_instance": 1.33,
-  "ampere_memory_per_instance": 8,
+  "ampere_node_names": ["ampere1", "ampere2", "ampere3"],
+  "ampere_ocpus_per_instance": 1,
+  "ampere_memory_per_instance": 6,
   "ampere_boot_volume_size": 50,
-  "micro_instance_count": 1,
+  "micro_node_names": ["micro1"],
   "micro_boot_volume_size": 50,
   "enable_free_lb": true,
   "lb_display_name": "free-tier-lb"

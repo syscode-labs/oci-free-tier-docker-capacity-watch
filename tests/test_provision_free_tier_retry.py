@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -138,6 +140,33 @@ def test_oci_sdk_mapping_list_and_capacity_report(monkeypatch: pytest.MonkeyPatc
         ]
     )
     assert report["data"]["shape-availabilities"][0]["availability-status"] == "AVAILABLE"
+
+
+def test_load_profile_defaults_new_schema(tmp_path: Path) -> None:
+    defaults = tmp_path / "defaults.json"
+    defaults.write_text(
+        json.dumps({
+            "ampere_node_names": ["ampere1", "ampere2"],
+            "ampere_ocpus_per_instance": 1,
+            "ampere_memory_per_instance": 6,
+            "ampere_boot_volume_size": 50,
+            "micro_node_names": ["micro1"],
+            "micro_boot_volume_size": 50,
+            "enable_free_lb": False,
+            "lb_display_name": "free-tier-lb",
+        }),
+        encoding="utf-8",
+    )
+    result = mod.load_profile_defaults(defaults)
+    assert result["ampere_node_names"] == ["ampere1", "ampere2"]
+    assert result["micro_node_names"] == ["micro1"]
+
+
+def test_load_profile_defaults_rejects_old_schema(tmp_path: Path) -> None:
+    defaults = tmp_path / "defaults.json"
+    defaults.write_text(json.dumps({"ampere_instance_count": 4}), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="missing keys"):
+        mod.load_profile_defaults(defaults)
 
 
 def test_oci_sdk_mapping_unsupported_command(monkeypatch: pytest.MonkeyPatch) -> None:
