@@ -4,6 +4,11 @@
     "compartment_id": "ocid1.compartment.oc1..REPLACE",
     "existing_subnet_id": "ocid1.subnet.oc1..REPLACE",
     "report_output": "./state/fonderiadigitale-import.tf",
+    "report_push": {
+      "github_repo": "your-org/infra-private",
+      "github_path": "oci/fonderiadigitale-import.tf",
+      "github_branch": "main"
+    },
     "ampere_node_names": ["ampere1", "ampere2", "ampere3"],
     "micro_node_names": ["micro1"],
     "enable_free_lb": false

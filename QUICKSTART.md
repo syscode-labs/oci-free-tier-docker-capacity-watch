@@ -30,7 +30,11 @@ Edit `config/profile.defaults.json` to set OCPU/memory/boot size per instance ty
 export OCI_CONFIG_DIR=~/.oci     # directory containing your OCI config and key files
 export SSH_KEY_FILE=~/.ssh/id_rsa.pub
 export RETRY_SECONDS=300         # optional, default 300
+export GITHUB_TOKEN=ghp_...      # optional: push import reports to GitHub automatically
 ```
+
+`GITHUB_TOKEN` needs `contents: write` on the target repo. If not set, the import report
+is only written locally to `./state/` and a warning is logged.
 
 ## 3) Start watcher
 

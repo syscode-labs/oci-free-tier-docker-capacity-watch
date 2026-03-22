@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import sys
@@ -569,6 +570,121 @@ def test_ensure_iam_setup_idempotent_existing_resources(monkeypatch: pytest.Monk
     assert ids["user_id"] == "ocid1.user.oc1..u1"
     assert ids["membership_id"] == "ocid1.membership.oc1..existing"
     assert ids["policy_id"] == "ocid1.policy.oc1..p1"
+
+
+def test_push_report_to_github_create(monkeypatch: pytest.MonkeyPatch) -> None:
+    """New file: GET returns 404, PUT creates it."""
+    calls: list[tuple[str, bytes | None]] = []
+
+    class _FakeResponse:
+        def __init__(self, body: bytes) -> None:
+            self._body = body
+
+        def read(self) -> bytes:
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+    def fake_urlopen(req):
+        calls.append((req.get_method(), req.data))
+        if req.get_method() == "GET" or (isinstance(req, mod.urllib.request.Request) and req.data is None):
+            raise mod.urllib.error.HTTPError(url="", code=404, msg="Not Found", hdrs=None, fp=None)
+        return _FakeResponse(json.dumps({"commit": {"sha": "abc1234def"}}).encode())
+
+    # Override GET to raise 404, PUT to succeed
+    get_called = []
+    put_called = []
+
+    original_urlopen = mod.urllib.request.urlopen
+
+    def patched_urlopen(req):
+        method = req.get_method() if hasattr(req, "get_method") else "GET"
+        if req.data is None:
+            get_called.append(True)
+            raise mod.urllib.error.HTTPError(url="", code=404, msg="Not Found", hdrs=None, fp=None)
+        put_called.append(json.loads(req.data))
+        return _FakeResponse(json.dumps({"commit": {"sha": "abc1234"}}).encode())
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", patched_urlopen)
+
+    mod.push_report_to_github(
+        content="import {}\n",
+        repo="org/infra",
+        path="oci/test-import.tf",
+        branch="main",
+        token="ghp_fake",
+        commit_message="chore: test",
+    )
+
+    assert len(put_called) == 1
+    payload = put_called[0]
+    assert payload["branch"] == "main"
+    assert payload["message"] == "chore: test"
+    assert "sha" not in payload  # new file — no existing SHA
+    assert base64.b64decode(payload["content"]).decode() == "import {}\n"
+
+
+def test_push_report_to_github_update(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Existing file: GET returns SHA, PUT includes it."""
+    put_called = []
+
+    class _FakeResponse:
+        def __init__(self, body: bytes) -> None:
+            self._body = body
+
+        def read(self) -> bytes:
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+    def patched_urlopen(req):
+        if req.data is None:  # GET
+            return _FakeResponse(json.dumps({"sha": "existing-sha-123"}).encode())
+        put_called.append(json.loads(req.data))  # PUT
+        return _FakeResponse(json.dumps({"commit": {"sha": "new-sha-456"}}).encode())
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", patched_urlopen)
+
+    mod.push_report_to_github(
+        content="import {}\n",
+        repo="org/infra",
+        path="oci/test-import.tf",
+        branch="main",
+        token="ghp_fake",
+        commit_message="chore: update",
+    )
+
+    assert len(put_called) == 1
+    assert put_called[0]["sha"] == "existing-sha-123"
+
+
+def test_load_accounts_report_push(tmp_path: Path) -> None:
+    accounts_file = tmp_path / "accounts.json"
+    accounts_file.write_text(
+        json.dumps([{
+            "profile": "myprofile",
+            "compartment_id": "ocid1.compartment.oc1..abc",
+            "report_push": {
+                "github_repo": "org/infra",
+                "github_path": "oci/myprofile-import.tf",
+                "github_branch": "deploy",
+            },
+        }]),
+        encoding="utf-8",
+    )
+    states = mod.load_accounts(accounts_file, _minimal_defaults())
+    s = states[0]
+    assert s.report_push_github_repo == "org/infra"
+    assert s.report_push_github_path == "oci/myprofile-import.tf"
+    assert s.report_push_github_branch == "deploy"
 
 
 def test_oci_sdk_mapping_unsupported_command(monkeypatch: pytest.MonkeyPatch) -> None:

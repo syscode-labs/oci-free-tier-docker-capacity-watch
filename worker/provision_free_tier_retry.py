@@ -10,14 +10,17 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import configparser
 import json
+import math
 import os
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
-import math
 from pathlib import Path
 from typing import Any
 
@@ -567,6 +570,10 @@ class AccountState:
     create_compartment: bool = False
     compartment_name: str | None = None
     iam_api_public_key: str | None = None
+    # optional report push (GitHub)
+    report_push_github_repo: str | None = None    # e.g. "org/infra-private"
+    report_push_github_path: str | None = None    # e.g. "oci/profile-import.tf"
+    report_push_github_branch: str = "main"
     # mutable per-run tracking
     done: bool = False
     created_ampere: list[tuple[str, str, str]] = field(default_factory=list)  # (name, instance_id, pip_id)
@@ -605,6 +612,7 @@ def load_accounts(path: Path, defaults: dict[str, Any]) -> list[AccountState]:
                 )
 
         report_output = entry.get("report_output", f"./state/{profile}-import.tf")
+        push = entry.get("report_push", {})
         states.append(AccountState(
             profile=profile,
             compartment_id=compartment_id,
@@ -617,6 +625,9 @@ def load_accounts(path: Path, defaults: dict[str, Any]) -> list[AccountState]:
             create_compartment=create_compartment,
             compartment_name=compartment_name,
             iam_api_public_key=entry.get("iam_api_public_key"),
+            report_push_github_repo=push.get("github_repo"),
+            report_push_github_path=push.get("github_path"),
+            report_push_github_branch=push.get("github_branch", "main"),
         ))
     return states
 
@@ -1469,6 +1480,62 @@ def generate_import_report(
     log(f"Import report written to {output_path}")
 
 
+def push_report_to_github(
+    *,
+    content: str,
+    repo: str,
+    path: str,
+    branch: str,
+    token: str,
+    commit_message: str,
+) -> None:
+    """Create or update a file in a GitHub repo via the REST API.
+
+    Uses GITHUB_TOKEN for auth. No git binary required — pure HTTPS.
+    """
+    api_url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type": "application/json",
+    }
+
+    # GET existing file to obtain its SHA (required for updates)
+    existing_sha: str | None = None
+    try:
+        req = urllib.request.Request(f"{api_url}?ref={branch}", headers=headers)
+        with urllib.request.urlopen(req) as resp:
+            existing = json.loads(resp.read())
+            existing_sha = existing.get("sha")
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            raise RuntimeError(f"GitHub GET {path}: HTTP {exc.code} {exc.reason}") from exc
+
+    payload: dict[str, Any] = {
+        "message": commit_message,
+        "content": base64.b64encode(content.encode()).decode(),
+        "branch": branch,
+    }
+    if existing_sha:
+        payload["sha"] = existing_sha
+
+    req = urllib.request.Request(
+        api_url,
+        data=json.dumps(payload).encode(),
+        headers=headers,
+        method="PUT",
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            result = json.loads(resp.read())
+            action = "Updated" if existing_sha else "Created"
+            log(f"GitHub: {action} {repo}/{path} on {branch} — {result['commit']['sha'][:7]}")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode(errors="replace")
+        raise RuntimeError(f"GitHub PUT {path}: HTTP {exc.code} — {body}") from exc
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Provision OCI Always Free resources across multiple accounts")
     parser.add_argument(
@@ -1527,6 +1594,22 @@ def main() -> int:
                     micro_instances=account.created_micro,
                     iam_ids=account.iam_ids,
                 )
+                if account.report_push_github_repo and account.report_push_github_path:
+                    github_token = os.environ.get("GITHUB_TOKEN", "")
+                    if not github_token:
+                        log(f"[{account.profile}] WARNING: report_push configured but GITHUB_TOKEN not set — skipping push")
+                    else:
+                        try:
+                            push_report_to_github(
+                                content=account.report_output.read_text(encoding="utf-8"),
+                                repo=account.report_push_github_repo,
+                                path=account.report_push_github_path,
+                                branch=account.report_push_github_branch,
+                                token=github_token,
+                                commit_message=f"chore: import report for {account.profile} [{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}]",
+                            )
+                        except RuntimeError as exc:
+                            log(f"[{account.profile}] WARNING: GitHub push failed: {exc}")
                 account.done = True
 
         if all(a.done for a in accounts):
