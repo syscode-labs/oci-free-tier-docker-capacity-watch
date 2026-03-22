@@ -14,5 +14,14 @@
     "report_output": "./state/syscode-import.tf",
     "ampere_node_names": ["oci-talos-cp-1", "oci-talos-cp-2", "oci-talos-cp-3", "oci-talos-worker-1"],
     "micro_node_names": []
+  },
+  {
+    "profile": "new-account",
+    "create_compartment": true,
+    "compartment_name": "free-tier-homelab",
+    "iam_api_public_key": null,
+    "report_output": "./state/new-account-import.tf",
+    "ampere_node_names": ["k8s-cp-1", "k8s-cp-2", "k8s-worker-1"],
+    "micro_node_names": ["bastion"]
   }
 ]

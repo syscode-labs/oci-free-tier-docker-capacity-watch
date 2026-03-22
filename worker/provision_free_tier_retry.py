@@ -149,6 +149,61 @@ class OciCli:
                     description=self._require_flag(args, "--description"),
                 )
                 return self._data(self.identity_client.create_compartment(details).data)
+            if command == ("iam", "group", "list"):
+                return self._list_all(
+                    self.identity_client.list_groups,
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                    name=self._flag(args, "--name"),
+                )
+            if command == ("iam", "group", "create"):
+                details = oci.identity.models.CreateGroupDetails(
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                    name=self._require_flag(args, "--name"),
+                    description=self._require_flag(args, "--description"),
+                )
+                return self._data(self.identity_client.create_group(details).data)
+            if command == ("iam", "user", "list"):
+                return self._list_all(
+                    self.identity_client.list_users,
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                    name=self._flag(args, "--name"),
+                )
+            if command == ("iam", "user", "create"):
+                details = oci.identity.models.CreateUserDetails(
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                    name=self._require_flag(args, "--name"),
+                    description=self._require_flag(args, "--description"),
+                )
+                return self._data(self.identity_client.create_user(details).data)
+            if command == ("iam", "group-membership", "create"):
+                details = oci.identity.models.AddUserToGroupDetails(
+                    user_id=self._require_flag(args, "--user-id"),
+                    group_id=self._require_flag(args, "--group-id"),
+                )
+                return self._data(self.identity_client.add_user_to_group(details).data)
+            if command == ("iam", "policy", "list"):
+                return self._list_all(
+                    self.identity_client.list_policies,
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                    name=self._flag(args, "--name"),
+                )
+            if command == ("iam", "policy", "create"):
+                statements = json.loads(self._require_flag(args, "--statements"))
+                details = oci.identity.models.CreatePolicyDetails(
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                    name=self._require_flag(args, "--name"),
+                    description=self._require_flag(args, "--description"),
+                    statements=statements,
+                )
+                return self._data(self.identity_client.create_policy(details).data)
+            if command == ("iam", "api-key", "upload"):
+                details = oci.identity.models.CreateApiKeyDetails(
+                    key=self._require_flag(args, "--key"),
+                )
+                return self._data(self.identity_client.upload_api_key(
+                    user_id=self._require_flag(args, "--user-id"),
+                    create_api_key_details=details,
+                ).data)
             if command == ("iam", "availability-domain", "list"):
                 return self._list_all(
                     self.identity_client.list_availability_domains,
@@ -494,13 +549,17 @@ def load_profile_defaults(path: Path) -> dict[str, Any]:
 @dataclass
 class AccountState:
     profile: str
-    compartment_id: str
+    compartment_id: str | None  # None when create_compartment=True (resolved by ensure_iam_setup)
     existing_subnet_id: str | None
     report_output: Path
     ampere_names: list[str]
     micro_names: list[str]
     enable_free_lb: bool
     lb_display_name: str
+    # optional IAM provisioning
+    create_compartment: bool = False
+    compartment_name: str | None = None
+    iam_api_public_key: str | None = None
     # mutable per-run tracking
     done: bool = False
     created_ampere: list[tuple[str, str, str]] = field(default_factory=list)  # (name, instance_id, pip_id)
@@ -508,6 +567,7 @@ class AccountState:
     networking_ids: dict[str, str] | None = None
     lb_id: str | None = None
     subnet_id: str | None = None
+    iam_ids: dict[str, str] | None = None
 
 
 def load_accounts(path: Path, defaults: dict[str, Any]) -> list[AccountState]:
@@ -519,11 +579,23 @@ def load_accounts(path: Path, defaults: dict[str, Any]) -> list[AccountState]:
     states: list[AccountState] = []
     for i, entry in enumerate(entries):
         profile = entry.get("profile")
-        compartment_id = entry.get("compartment_id")
         if not profile:
             raise RuntimeError(f"accounts[{i}] missing required key 'profile'")
-        if not compartment_id:
-            raise RuntimeError(f"accounts[{i}] missing required key 'compartment_id'")
+
+        create_compartment = parse_bool(entry.get("create_compartment", False))
+        compartment_id = entry.get("compartment_id")
+        compartment_name = entry.get("compartment_name")
+
+        if create_compartment:
+            if not compartment_name:
+                raise RuntimeError(
+                    f"accounts[{i}] ({profile}): 'compartment_name' is required when 'create_compartment' is true"
+                )
+        else:
+            if not compartment_id:
+                raise RuntimeError(
+                    f"accounts[{i}] ({profile}): 'compartment_id' is required when 'create_compartment' is false"
+                )
 
         report_output = entry.get("report_output", f"./state/{profile}-import.tf")
         states.append(AccountState(
@@ -535,6 +607,9 @@ def load_accounts(path: Path, defaults: dict[str, Any]) -> list[AccountState]:
             micro_names=entry.get("micro_node_names", defaults["micro_node_names"]),
             enable_free_lb=entry.get("enable_free_lb", defaults["enable_free_lb"]),
             lb_display_name=entry.get("lb_display_name", defaults["lb_display_name"]),
+            create_compartment=create_compartment,
+            compartment_name=compartment_name,
+            iam_api_public_key=entry.get("iam_api_public_key"),
         ))
     return states
 
@@ -1067,6 +1142,139 @@ def scan_available_ads(
     return available
 
 
+def ensure_iam_setup(oci_cli: OciCli, account: AccountState, tenancy_id: str) -> dict[str, str]:
+    """Create or find compartment + IAM group/user/policy for account.
+
+    Sets account.compartment_id to the resolved compartment OCID.
+    Returns dict of created/found resource OCIDs.
+    """
+    name = account.compartment_name
+    prefix = f"[{account.profile}]"
+
+    # Ensure compartment (child of tenancy)
+    existing = oci_cli.run([
+        "iam", "compartment", "list",
+        "--compartment-id", tenancy_id,
+        "--name", name,
+        "--lifecycle-state", "ACTIVE",
+    ])["data"]
+    if existing:
+        compartment_id = existing[0]["id"]
+        log(f"{prefix} Compartment '{name}' already exists: {compartment_id}")
+    else:
+        result = oci_cli.run([
+            "iam", "compartment", "create",
+            "--compartment-id", tenancy_id,
+            "--name", name,
+            "--description", f"Managed free-tier compartment for {name}",
+        ])["data"]
+        compartment_id = result["id"]
+        log(f"{prefix} Created compartment '{name}': {compartment_id}")
+    account.compartment_id = compartment_id
+
+    group_name = f"{name}-managers"
+    user_name = f"{name}-user"
+    policy_name = f"{name}-policy"
+
+    # Ensure group (tenancy-level)
+    existing_groups = oci_cli.run([
+        "iam", "group", "list",
+        "--compartment-id", tenancy_id,
+        "--name", group_name,
+    ])["data"]
+    if existing_groups:
+        group_id = existing_groups[0]["id"]
+        log(f"{prefix} IAM group '{group_name}' already exists")
+    else:
+        result = oci_cli.run([
+            "iam", "group", "create",
+            "--compartment-id", tenancy_id,
+            "--name", group_name,
+            "--description", f"Service group with access to {name} compartment",
+        ])["data"]
+        group_id = result["id"]
+        log(f"{prefix} Created IAM group '{group_name}': {group_id}")
+
+    # Ensure user (tenancy-level)
+    existing_users = oci_cli.run([
+        "iam", "user", "list",
+        "--compartment-id", tenancy_id,
+        "--name", user_name,
+    ])["data"]
+    if existing_users:
+        user_id = existing_users[0]["id"]
+        log(f"{prefix} IAM user '{user_name}' already exists")
+    else:
+        result = oci_cli.run([
+            "iam", "user", "create",
+            "--compartment-id", tenancy_id,
+            "--name", user_name,
+            "--description", f"Service user for {name} compartment",
+        ])["data"]
+        user_id = result["id"]
+        log(f"{prefix} Created IAM user '{user_name}': {user_id}")
+
+    # Ensure group membership (idempotent — handle 409 if already member)
+    try:
+        oci_cli.run([
+            "iam", "group-membership", "create",
+            "--user-id", user_id,
+            "--group-id", group_id,
+        ])
+        log(f"{prefix} Added {user_name} to {group_name}")
+    except OciCliError as exc:
+        msg = str(exc)
+        if not any(token in msg for token in ("already", "409", "Conflict", "duplicate")):
+            raise
+        log(f"{prefix} {user_name} already member of {group_name}")
+
+    # Ensure policy (tenancy-level, granting group access to compartment)
+    existing_policies = oci_cli.run([
+        "iam", "policy", "list",
+        "--compartment-id", tenancy_id,
+        "--name", policy_name,
+    ])["data"]
+    if existing_policies:
+        policy_id = existing_policies[0]["id"]
+        log(f"{prefix} IAM policy '{policy_name}' already exists")
+    else:
+        statements = [f"Allow group {group_name} to manage all-resources in compartment {name}"]
+        result = oci_cli.run([
+            "iam", "policy", "create",
+            "--compartment-id", tenancy_id,
+            "--name", policy_name,
+            "--description", f"Grants {group_name} full access to {name}",
+            "--statements", json.dumps(statements),
+        ])["data"]
+        policy_id = result["id"]
+        log(f"{prefix} Created IAM policy '{policy_name}': {policy_id}")
+
+    ids: dict[str, str] = {
+        "compartment_id": compartment_id,
+        "group_id": group_id,
+        "user_id": user_id,
+        "policy_id": policy_id,
+    }
+
+    # Optional API key registration
+    if account.iam_api_public_key:
+        try:
+            result = oci_cli.run([
+                "iam", "api-key", "upload",
+                "--user-id", user_id,
+                "--key", account.iam_api_public_key,
+            ])["data"]
+            fingerprint = result.get("fingerprint", "")
+            ids["api_key_fingerprint"] = fingerprint
+            log(f"{prefix} Registered API key, fingerprint: {fingerprint}")
+        except OciCliError as exc:
+            if "already" not in str(exc).lower():
+                raise
+            log(f"{prefix} API key already registered for {user_name}")
+
+    return ids
+
+
 def provision_account(
     oci_cli: OciCli,
     account: AccountState,
@@ -1079,9 +1287,14 @@ def provision_account(
     Mutates account.created_ampere, account.created_micro, account.subnet_id,
     account.networking_ids, account.lb_id in place.
     """
-    compartment_id = account.compartment_id
     tenancy_ocid = read_profile_values(account.profile)["tenancy"]
     prefix = f"[{account.profile}]"
+
+    # First-time IAM + compartment setup (when create_compartment=True)
+    if account.create_compartment and account.iam_ids is None:
+        account.iam_ids = ensure_iam_setup(oci_cli, account, tenancy_ocid)
+
+    compartment_id = account.compartment_id
 
     # First-time networking setup
     if account.subnet_id is None:
@@ -1191,6 +1404,7 @@ def generate_import_report(
     lb_id: str | None,
     ampere_instances: list[tuple[str, str, str]],
     micro_instances: list[tuple[str, str, str]],
+    iam_ids: dict[str, str] | None = None,
 ) -> None:
     """Write a .tf file with tofu import{} blocks for all resources created this run.
 
@@ -1208,6 +1422,11 @@ def generate_import_report(
         "#   tofu apply -var-file=<account>.tfvars -chdir=module/tofu/oci",
         "",
     ]
+    if iam_ids:
+        lines += block("oci_identity_compartment.managed[0]", iam_ids["compartment_id"])
+        lines += block("oci_identity_group.free_tier[0]", iam_ids["group_id"])
+        lines += block("oci_identity_user.free_tier[0]", iam_ids["user_id"])
+        lines += block("oci_identity_policy.free_tier[0]", iam_ids["policy_id"])
     if networking:
         lines += block("oci_core_vcn.free_tier_vcn[0]", networking["vcn_id"])
         lines += block("oci_core_internet_gateway.free_tier_igw[0]", networking["igw_id"])
@@ -1284,6 +1503,7 @@ def main() -> int:
                     lb_id=account.lb_id,
                     ampere_instances=account.created_ampere,
                     micro_instances=account.created_micro,
+                    iam_ids=account.iam_ids,
                 )
                 account.done = True
 

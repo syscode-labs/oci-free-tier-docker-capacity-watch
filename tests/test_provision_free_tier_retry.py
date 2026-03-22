@@ -393,6 +393,173 @@ def test_generate_import_report_skips_none(tmp_path: Path) -> None:
     assert "ampere_instance[0]" in content
 
 
+def test_load_accounts_create_compartment(tmp_path: Path) -> None:
+    accounts_file = tmp_path / "accounts.json"
+    accounts_file.write_text(
+        json.dumps([{
+            "profile": "new-acct",
+            "create_compartment": True,
+            "compartment_name": "free-tier-homelab",
+        }]),
+        encoding="utf-8",
+    )
+    states = mod.load_accounts(accounts_file, _minimal_defaults())
+    s = states[0]
+    assert s.create_compartment is True
+    assert s.compartment_name == "free-tier-homelab"
+    assert s.compartment_id is None
+
+
+def test_load_accounts_create_compartment_requires_name(tmp_path: Path) -> None:
+    accounts_file = tmp_path / "accounts.json"
+    accounts_file.write_text(
+        json.dumps([{"profile": "p1", "create_compartment": True}]),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="compartment_name"):
+        mod.load_accounts(accounts_file, _minimal_defaults())
+
+
+def test_generate_import_report_with_iam_ids(tmp_path: Path) -> None:
+    output_path = tmp_path / "imports.tf"
+    mod.generate_import_report(
+        output_path=output_path,
+        networking=None,
+        lb_id=None,
+        ampere_instances=[("k8s-cp-1", "ocid1.instance.a1", "ocid1.pip.a1")],
+        micro_instances=[],
+        iam_ids={
+            "compartment_id": "ocid1.compartment.oc1..managed",
+            "group_id": "ocid1.group.oc1..g1",
+            "user_id": "ocid1.user.oc1..u1",
+            "policy_id": "ocid1.policy.oc1..p1",
+        },
+    )
+    content = output_path.read_text(encoding="utf-8")
+    assert "to = oci_identity_compartment.managed[0]" in content
+    assert 'id = "ocid1.compartment.oc1..managed"' in content
+    assert "to = oci_identity_group.free_tier[0]" in content
+    assert "to = oci_identity_user.free_tier[0]" in content
+    assert "to = oci_identity_policy.free_tier[0]" in content
+
+
+_FAKE_GROUP = {"id": "ocid1.group.oc1..g1", "name": "homelab-managers", "lifecycle_state": "ACTIVE"}
+_FAKE_USER = {"id": "ocid1.user.oc1..u1", "name": "homelab-user", "lifecycle_state": "ACTIVE"}
+_FAKE_MEMBERSHIP = {"id": "ocid1.membership.oc1..m1", "user_id": "ocid1.user.oc1..u1"}
+_FAKE_POLICY = {"id": "ocid1.policy.oc1..p1", "name": "homelab-policy"}
+_FAKE_COMPARTMENT = {"id": "ocid1.compartment.oc1..managed", "name": "free-tier-homelab", "lifecycle_state": "ACTIVE"}
+
+
+class _FakeIdentityClientIam(_FakeIdentityClient):
+    def list_compartments(self, **kwargs):
+        return SimpleNamespace(data=[])  # no existing compartment → will create
+
+    def create_compartment(self, details):
+        return SimpleNamespace(data={"id": "ocid1.compartment.oc1..managed", "name": details.name})
+
+    def list_groups(self, **kwargs):
+        return SimpleNamespace(data=[])
+
+    def create_group(self, details):
+        return SimpleNamespace(data=_FAKE_GROUP)
+
+    def list_users(self, **kwargs):
+        return SimpleNamespace(data=[])
+
+    def create_user(self, details):
+        return SimpleNamespace(data=_FAKE_USER)
+
+    def add_user_to_group(self, details):
+        return SimpleNamespace(data=_FAKE_MEMBERSHIP)
+
+    def list_policies(self, **kwargs):
+        return SimpleNamespace(data=[])
+
+    def create_policy(self, details):
+        assert "manage all-resources in compartment" in details.statements[0]
+        return SimpleNamespace(data=_FAKE_POLICY)
+
+
+def _make_iam_cli(monkeypatch: pytest.MonkeyPatch) -> Any:
+    monkeypatch.setattr(mod.oci.identity, "IdentityClient", lambda _cfg: _FakeIdentityClientIam())
+    monkeypatch.setattr(mod.oci.core, "VirtualNetworkClient", lambda _cfg: _FakeNetworkClient())
+    monkeypatch.setattr(mod.oci.core, "ComputeClient", lambda _cfg: _FakeComputeClient())
+    monkeypatch.setattr(mod.oci.load_balancer, "LoadBalancerClient", lambda _cfg: _FakeLbClient())
+    monkeypatch.setattr(mod, "list_call_get_all_results", _fake_list_call_get_all_results)
+    return mod.OciCli(profile="gf78", config={"region": "eu-frankfurt-1"})
+
+
+def test_ensure_iam_setup_creates_resources(monkeypatch: pytest.MonkeyPatch) -> None:
+    cli = _make_iam_cli(monkeypatch)
+    account = mod.AccountState(
+        profile="new-acct",
+        compartment_id=None,
+        existing_subnet_id=None,
+        report_output=Path("./state/new-acct-import.tf"),
+        ampere_names=["k8s-cp-1"],
+        micro_names=[],
+        enable_free_lb=False,
+        lb_display_name="free-tier-lb",
+        create_compartment=True,
+        compartment_name="free-tier-homelab",
+    )
+    ids = mod.ensure_iam_setup(cli, account, "ocid1.tenancy.oc1..t1")
+    assert ids["compartment_id"] == "ocid1.compartment.oc1..managed"
+    assert ids["group_id"] == "ocid1.group.oc1..g1"
+    assert ids["user_id"] == "ocid1.user.oc1..u1"
+    assert ids["policy_id"] == "ocid1.policy.oc1..p1"
+    assert account.compartment_id == "ocid1.compartment.oc1..managed"
+
+
+def test_ensure_iam_setup_idempotent_existing_resources(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When all resources already exist, ensure_iam_setup returns their existing IDs."""
+
+    class _ExistingIdentityClient(_FakeIdentityClientIam):
+        def list_compartments(self, **kwargs):
+            return SimpleNamespace(data=[_FAKE_COMPARTMENT])
+
+        def list_groups(self, **kwargs):
+            return SimpleNamespace(data=[_FAKE_GROUP])
+
+        def list_users(self, **kwargs):
+            return SimpleNamespace(data=[_FAKE_USER])
+
+        def add_user_to_group(self, details):
+            # Simulate 409 already-member error
+            raise mod.oci.exceptions.ServiceError(
+                status=409, code="Conflict",
+                headers={}, message="already member", request_id="r1",
+            )
+
+        def list_policies(self, **kwargs):
+            return SimpleNamespace(data=[_FAKE_POLICY])
+
+    monkeypatch.setattr(mod.oci.identity, "IdentityClient", lambda _cfg: _ExistingIdentityClient())
+    monkeypatch.setattr(mod.oci.core, "VirtualNetworkClient", lambda _cfg: _FakeNetworkClient())
+    monkeypatch.setattr(mod.oci.core, "ComputeClient", lambda _cfg: _FakeComputeClient())
+    monkeypatch.setattr(mod.oci.load_balancer, "LoadBalancerClient", lambda _cfg: _FakeLbClient())
+    monkeypatch.setattr(mod, "list_call_get_all_results", _fake_list_call_get_all_results)
+
+    cli = mod.OciCli(profile="gf78", config={"region": "eu-frankfurt-1"})
+    account = mod.AccountState(
+        profile="new-acct",
+        compartment_id=None,
+        existing_subnet_id=None,
+        report_output=Path("./state/new-acct-import.tf"),
+        ampere_names=["k8s-cp-1"],
+        micro_names=[],
+        enable_free_lb=False,
+        lb_display_name="free-tier-lb",
+        create_compartment=True,
+        compartment_name="free-tier-homelab",
+    )
+    ids = mod.ensure_iam_setup(cli, account, "ocid1.tenancy.oc1..t1")
+    assert ids["compartment_id"] == "ocid1.compartment.oc1..managed"
+    assert ids["group_id"] == "ocid1.group.oc1..g1"
+    assert ids["user_id"] == "ocid1.user.oc1..u1"
+    assert ids["policy_id"] == "ocid1.policy.oc1..p1"
+
+
 def test_oci_sdk_mapping_unsupported_command(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(mod.oci.identity, "IdentityClient", lambda _cfg: _FakeIdentityClient())
     monkeypatch.setattr(mod.oci.core, "VirtualNetworkClient", lambda _cfg: _FakeNetworkClient())
