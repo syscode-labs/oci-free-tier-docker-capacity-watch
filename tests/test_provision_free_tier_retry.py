@@ -432,7 +432,9 @@ def test_generate_import_report_with_iam_ids(tmp_path: Path) -> None:
             "compartment_id": "ocid1.compartment.oc1..managed",
             "group_id": "ocid1.group.oc1..g1",
             "user_id": "ocid1.user.oc1..u1",
+            "membership_id": "ocid1.membership.oc1..m1",
             "policy_id": "ocid1.policy.oc1..p1",
+            "api_key_fingerprint": "aa:bb:cc:dd",
         },
     )
     content = output_path.read_text(encoding="utf-8")
@@ -440,7 +442,11 @@ def test_generate_import_report_with_iam_ids(tmp_path: Path) -> None:
     assert 'id = "ocid1.compartment.oc1..managed"' in content
     assert "to = oci_identity_group.free_tier[0]" in content
     assert "to = oci_identity_user.free_tier[0]" in content
+    assert "to = oci_identity_user_group_membership.free_tier[0]" in content
+    assert 'id = "ocid1.membership.oc1..m1"' in content
     assert "to = oci_identity_policy.free_tier[0]" in content
+    assert "to = oci_identity_api_key.free_tier[0]" in content
+    assert 'id = "ocid1.user.oc1..u1/aa:bb:cc:dd"' in content
 
 
 _FAKE_GROUP = {"id": "ocid1.group.oc1..g1", "name": "homelab-managers", "lifecycle_state": "ACTIVE"}
@@ -470,7 +476,7 @@ class _FakeIdentityClientIam(_FakeIdentityClient):
         return SimpleNamespace(data=_FAKE_USER)
 
     def add_user_to_group(self, details):
-        return SimpleNamespace(data=_FAKE_MEMBERSHIP)
+        return SimpleNamespace(data={**_FAKE_MEMBERSHIP, "id": "ocid1.membership.oc1..m1"})
 
     def list_policies(self, **kwargs):
         return SimpleNamespace(data=[])
@@ -507,6 +513,7 @@ def test_ensure_iam_setup_creates_resources(monkeypatch: pytest.MonkeyPatch) -> 
     assert ids["compartment_id"] == "ocid1.compartment.oc1..managed"
     assert ids["group_id"] == "ocid1.group.oc1..g1"
     assert ids["user_id"] == "ocid1.user.oc1..u1"
+    assert ids["membership_id"] == "ocid1.membership.oc1..m1"
     assert ids["policy_id"] == "ocid1.policy.oc1..p1"
     assert account.compartment_id == "ocid1.compartment.oc1..managed"
 
@@ -530,6 +537,9 @@ def test_ensure_iam_setup_idempotent_existing_resources(monkeypatch: pytest.Monk
                 status=409, code="Conflict",
                 headers={}, message="already member", request_id="r1",
             )
+
+        def list_user_group_memberships(self, **kwargs):
+            return SimpleNamespace(data=[{"id": "ocid1.membership.oc1..existing"}])
 
         def list_policies(self, **kwargs):
             return SimpleNamespace(data=[_FAKE_POLICY])
@@ -557,6 +567,7 @@ def test_ensure_iam_setup_idempotent_existing_resources(monkeypatch: pytest.Monk
     assert ids["compartment_id"] == "ocid1.compartment.oc1..managed"
     assert ids["group_id"] == "ocid1.group.oc1..g1"
     assert ids["user_id"] == "ocid1.user.oc1..u1"
+    assert ids["membership_id"] == "ocid1.membership.oc1..existing"
     assert ids["policy_id"] == "ocid1.policy.oc1..p1"
 
 

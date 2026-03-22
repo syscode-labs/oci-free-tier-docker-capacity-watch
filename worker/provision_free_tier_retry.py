@@ -181,6 +181,13 @@ class OciCli:
                     group_id=self._require_flag(args, "--group-id"),
                 )
                 return self._data(self.identity_client.add_user_to_group(details).data)
+            if command == ("iam", "group-membership", "list"):
+                return self._list_all(
+                    self.identity_client.list_user_group_memberships,
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                    user_id=self._flag(args, "--user-id"),
+                    group_id=self._flag(args, "--group-id"),
+                )
             if command == ("iam", "policy", "list"):
                 return self._list_all(
                     self.identity_client.list_policies,
@@ -1214,19 +1221,28 @@ def ensure_iam_setup(oci_cli: OciCli, account: AccountState, tenancy_id: str) ->
         user_id = result["id"]
         log(f"{prefix} Created IAM user '{user_name}': {user_id}")
 
-    # Ensure group membership (idempotent — handle 409 if already member)
+    # Ensure group membership — capture OCID for import report
     try:
-        oci_cli.run([
+        membership_result = oci_cli.run([
             "iam", "group-membership", "create",
             "--user-id", user_id,
             "--group-id", group_id,
-        ])
-        log(f"{prefix} Added {user_name} to {group_name}")
+        ])["data"]
+        membership_id = membership_result["id"]
+        log(f"{prefix} Added {user_name} to {group_name}: {membership_id}")
     except OciCliError as exc:
         msg = str(exc)
         if not any(token in msg for token in ("already", "409", "Conflict", "duplicate")):
             raise
-        log(f"{prefix} {user_name} already member of {group_name}")
+        # Already a member — look up the existing membership OCID
+        existing_memberships = oci_cli.run([
+            "iam", "group-membership", "list",
+            "--compartment-id", tenancy_id,
+            "--user-id", user_id,
+            "--group-id", group_id,
+        ])["data"]
+        membership_id = existing_memberships[0]["id"] if existing_memberships else ""
+        log(f"{prefix} {user_name} already member of {group_name}: {membership_id}")
 
     # Ensure policy (tenancy-level, granting group access to compartment)
     existing_policies = oci_cli.run([
@@ -1253,6 +1269,7 @@ def ensure_iam_setup(oci_cli: OciCli, account: AccountState, tenancy_id: str) ->
         "compartment_id": compartment_id,
         "group_id": group_id,
         "user_id": user_id,
+        "membership_id": membership_id,
         "policy_id": policy_id,
     }
 
@@ -1426,7 +1443,12 @@ def generate_import_report(
         lines += block("oci_identity_compartment.managed[0]", iam_ids["compartment_id"])
         lines += block("oci_identity_group.free_tier[0]", iam_ids["group_id"])
         lines += block("oci_identity_user.free_tier[0]", iam_ids["user_id"])
+        if iam_ids.get("membership_id"):
+            lines += block("oci_identity_user_group_membership.free_tier[0]", iam_ids["membership_id"])
         lines += block("oci_identity_policy.free_tier[0]", iam_ids["policy_id"])
+        if iam_ids.get("api_key_fingerprint"):
+            api_key_import_id = f"{iam_ids['user_id']}/{iam_ids['api_key_fingerprint']}"
+            lines += block("oci_identity_api_key.free_tier[0]", api_key_import_id)
     if networking:
         lines += block("oci_core_vcn.free_tier_vcn[0]", networking["vcn_id"])
         lines += block("oci_core_internet_gateway.free_tier_igw[0]", networking["igw_id"])
