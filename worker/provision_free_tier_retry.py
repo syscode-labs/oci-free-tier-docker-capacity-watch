@@ -576,6 +576,8 @@ class AccountState:
     report_push_github_repo: str | None = None    # e.g. "org/infra-private"
     report_push_github_path: str | None = None    # e.g. "oci/profile-import.tf"
     report_push_github_branch: str = "main"
+    # optional cloud-init URL for new micro instances (fetched once per cycle, base64-encoded)
+    micro_cloud_init_url: str | None = None
     # mutable per-run tracking
     done: bool = False
     created_ampere: list[tuple[str, str, str]] = field(default_factory=list)  # (name, instance_id, pip_id)
@@ -631,6 +633,7 @@ def load_accounts(path: Path, defaults: dict[str, Any]) -> list[AccountState]:
             report_push_github_repo=push.get("github_repo"),
             report_push_github_path=push.get("github_path"),
             report_push_github_branch=push.get("github_branch", "main"),
+        micro_cloud_init_url=entry.get("micro_cloud_init_url", defaults.get("micro_cloud_init_url")),
         ))
     return states
 
@@ -1052,6 +1055,7 @@ def launch_instance(
     boot_size: int,
     ssh_key_file: str,
     shape_config: dict[str, Any] | None = None,
+    user_data_b64: str | None = None,
 ) -> tuple[bool, str]:
     cmd = [
         "compute",
@@ -1073,9 +1077,18 @@ def launch_instance(
         subnet_id,
         "--assign-public-ip",
         "false",
-        "--ssh-authorized-keys-file",
-        ssh_key_file,
     ]
+
+    if user_data_b64:
+        # Combine ssh_authorized_keys and user_data in a single --metadata JSON to
+        # avoid OCI CLI merge ambiguity when both flags are set simultaneously.
+        ssh_key = Path(ssh_key_file).read_text(encoding="utf-8").strip()
+        cmd.extend(["--metadata", json.dumps({
+            "ssh_authorized_keys": ssh_key,
+            "user_data": user_data_b64,
+        })])
+    else:
+        cmd.extend(["--ssh-authorized-keys-file", ssh_key_file])
 
     if shape_config:
         cmd.extend(["--shape-config", json.dumps(shape_config)])
@@ -1361,6 +1374,16 @@ def provision_account(
     ampere_image_id = find_latest_image(oci_cli, compartment_id, "VM.Standard.A1.Flex")
     micro_image_id = find_latest_image(oci_cli, compartment_id, "VM.Standard.E2.1.Micro")
 
+    # Fetch micro cloud-init once per cycle (may be None if not configured).
+    micro_user_data_b64: str | None = None
+    if account.micro_cloud_init_url:
+        try:
+            with urllib.request.urlopen(account.micro_cloud_init_url, timeout=30) as resp:
+                micro_user_data_b64 = base64.b64encode(resp.read()).decode()
+            log(f"{prefix} Fetched micro cloud-init ({len(micro_user_data_b64)} b64 chars)")
+        except urllib.error.URLError as exc:
+            log(f"{prefix} WARNING: failed to fetch micro cloud-init: {exc}; launching without user-data")
+
     ampere_shape_config = {
         "ocpus": float(profile_defaults["ampere_ocpus_per_instance"]),
         "memoryInGBs": float(profile_defaults["ampere_memory_per_instance"]),
@@ -1379,11 +1402,13 @@ def provision_account(
     log(f"{prefix} Existing Micro: {sorted(existing_micro_names)} / targets: {account.micro_names}")
 
     def launch_and_assign_ip(name: str, shape: str, image_id: str, boot_size: int,
-                              ad: str, shape_config: dict | None = None) -> tuple[str, str, str] | None:
+                              ad: str, shape_config: dict | None = None,
+                              user_data_b64: str | None = None) -> tuple[str, str, str] | None:
         ok, detail = launch_instance(
             oci_cli, compartment_id=compartment_id, subnet_id=account.subnet_id,
             ad=ad, name=name, shape=shape, image_id=image_id,
             boot_size=boot_size, ssh_key_file=ssh_key_file, shape_config=shape_config,
+            user_data_b64=user_data_b64,
         )
         if not ok:
             category = classify_oci_error(detail)
@@ -1407,7 +1432,8 @@ def provision_account(
             break
         ad = available_micro_ads[idx % len(available_micro_ads)]
         result = launch_and_assign_ip(name, "VM.Standard.E2.1.Micro", micro_image_id,
-                                       int(profile_defaults["micro_boot_volume_size"]), ad)
+                                       int(profile_defaults["micro_boot_volume_size"]), ad,
+                                       user_data_b64=micro_user_data_b64)
         if result:
             account.created_micro.append(result)
 
