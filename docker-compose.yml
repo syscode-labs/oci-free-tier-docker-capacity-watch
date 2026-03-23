@@ -8,6 +8,7 @@ services:
       OCI_CONFIG_FILE: /root/.oci/config
       ACCOUNTS_FILE: /app/config/accounts.json
       PROFILE_DEFAULTS_FILE: /app/config/profile.defaults.json
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
     command:
       - --accounts-file=/app/config/accounts.json
       - --profile-defaults-file=/app/config/profile.defaults.json

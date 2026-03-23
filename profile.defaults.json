@@ -5,6 +5,7 @@
   "ampere_boot_volume_size": 50,
   "micro_node_names": ["micro1"],
   "micro_boot_volume_size": 50,
+  "micro_cloud_init_url": "https://objectstorage.uk-london-1.oraclecloud.com/p/6fl_eojNDXotpBC_92Vq9GYD16QOWpM2HoUT03wjo8MX9Ajn6wy3wiTABZPs3gW5/n/lrllg7vwdezx/b/syscode-infra-artifacts/o/cert-hub-host/cloud-init.yaml.gz",
   "enable_free_lb": true,
   "lb_display_name": "free-tier-lb"
 }

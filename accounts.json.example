@@ -4,6 +4,11 @@
     "compartment_id": "ocid1.compartment.oc1..REPLACE",
     "existing_subnet_id": "ocid1.subnet.oc1..REPLACE",
     "report_output": "./state/fonderiadigitale-import.tf",
+    "report_push": {
+      "github_repo": "your-org/infra-private",
+      "github_path": "oci/fonderiadigitale-import.tf",
+      "github_branch": "main"
+    },
     "ampere_node_names": ["ampere1", "ampere2", "ampere3"],
     "micro_node_names": ["micro1"],
     "enable_free_lb": false
@@ -14,5 +19,14 @@
     "report_output": "./state/syscode-import.tf",
     "ampere_node_names": ["oci-talos-cp-1", "oci-talos-cp-2", "oci-talos-cp-3", "oci-talos-worker-1"],
     "micro_node_names": []
+  },
+  {
+    "profile": "new-account",
+    "create_compartment": true,
+    "compartment_name": "free-tier-homelab",
+    "iam_api_public_key": null,
+    "report_output": "./state/new-account-import.tf",
+    "ampere_node_names": ["k8s-cp-1", "k8s-cp-2", "k8s-worker-1"],
+    "micro_node_names": ["bastion"]
   }
 ]

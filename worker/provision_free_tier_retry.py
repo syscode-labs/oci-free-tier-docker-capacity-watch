@@ -10,14 +10,17 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import configparser
 import json
+import math
 import os
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
-import math
 from pathlib import Path
 from typing import Any
 
@@ -39,7 +42,7 @@ class OciCli:
     def __init__(self, profile: str, region: str | None = None, config: dict[str, Any] | None = None) -> None:
         self.profile = profile
         self.region = region
-        config_file = os.environ.get("OCI_CONFIG_FILE")
+        config_file = os.environ.get("OCI_CONFIG_FILE") or oci.config.DEFAULT_LOCATION
         self.config = config or oci.config.from_file(file_location=config_file, profile_name=profile)
         if region:
             self.config["region"] = region
@@ -138,7 +141,7 @@ class OciCli:
                     self.identity_client.list_compartments,
                     compartment_id=self._require_flag(args, "--compartment-id"),
                     name=self._flag(args, "--name"),
-                    access_level=self._flag(args, "--access-level"),
+                    access_level=self._flag(args, "--access-level") or "ANY",
                     compartment_id_in_subtree=self._to_bool(self._flag(args, "--compartment-id-in-subtree")),
                     lifecycle_state=self._flag(args, "--lifecycle-state"),
                 )
@@ -149,6 +152,69 @@ class OciCli:
                     description=self._require_flag(args, "--description"),
                 )
                 return self._data(self.identity_client.create_compartment(details).data)
+            if command == ("iam", "group", "list"):
+                return self._list_all(
+                    self.identity_client.list_groups,
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                    name=self._flag(args, "--name"),
+                )
+            if command == ("iam", "group", "create"):
+                details = oci.identity.models.CreateGroupDetails(
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                    name=self._require_flag(args, "--name"),
+                    description=self._require_flag(args, "--description"),
+                )
+                return self._data(self.identity_client.create_group(details).data)
+            if command == ("iam", "user", "list"):
+                return self._list_all(
+                    self.identity_client.list_users,
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                    name=self._flag(args, "--name"),
+                )
+            if command == ("iam", "user", "create"):
+                details = oci.identity.models.CreateUserDetails(
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                    name=self._require_flag(args, "--name"),
+                    description=self._require_flag(args, "--description"),
+                    email=self._flag(args, "--email"),
+                )
+                return self._data(self.identity_client.create_user(details).data)
+            if command == ("iam", "group-membership", "create"):
+                details = oci.identity.models.AddUserToGroupDetails(
+                    user_id=self._require_flag(args, "--user-id"),
+                    group_id=self._require_flag(args, "--group-id"),
+                )
+                return self._data(self.identity_client.add_user_to_group(details).data)
+            if command == ("iam", "group-membership", "list"):
+                return self._list_all(
+                    self.identity_client.list_user_group_memberships,
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                    user_id=self._flag(args, "--user-id"),
+                    group_id=self._flag(args, "--group-id"),
+                )
+            if command == ("iam", "policy", "list"):
+                return self._list_all(
+                    self.identity_client.list_policies,
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                    name=self._flag(args, "--name"),
+                )
+            if command == ("iam", "policy", "create"):
+                statements = json.loads(self._require_flag(args, "--statements"))
+                details = oci.identity.models.CreatePolicyDetails(
+                    compartment_id=self._require_flag(args, "--compartment-id"),
+                    name=self._require_flag(args, "--name"),
+                    description=self._require_flag(args, "--description"),
+                    statements=statements,
+                )
+                return self._data(self.identity_client.create_policy(details).data)
+            if command == ("iam", "api-key", "upload"):
+                details = oci.identity.models.CreateApiKeyDetails(
+                    key=self._require_flag(args, "--key"),
+                )
+                return self._data(self.identity_client.upload_api_key(
+                    user_id=self._require_flag(args, "--user-id"),
+                    create_api_key_details=details,
+                ).data)
             if command == ("iam", "availability-domain", "list"):
                 return self._list_all(
                     self.identity_client.list_availability_domains,
@@ -494,13 +560,24 @@ def load_profile_defaults(path: Path) -> dict[str, Any]:
 @dataclass
 class AccountState:
     profile: str
-    compartment_id: str
+    compartment_id: str | None  # None when create_compartment=True (resolved by ensure_iam_setup)
     existing_subnet_id: str | None
     report_output: Path
     ampere_names: list[str]
     micro_names: list[str]
     enable_free_lb: bool
     lb_display_name: str
+    # optional IAM provisioning
+    create_compartment: bool = False
+    compartment_name: str | None = None
+    iam_api_public_key: str | None = None
+    iam_user_email: str | None = None  # required for IDCS-federated tenancies
+    # optional report push (GitHub)
+    report_push_github_repo: str | None = None    # e.g. "org/infra-private"
+    report_push_github_path: str | None = None    # e.g. "oci/profile-import.tf"
+    report_push_github_branch: str = "main"
+    # optional cloud-init URL for new micro instances (fetched once per cycle, base64-encoded)
+    micro_cloud_init_url: str | None = None
     # mutable per-run tracking
     done: bool = False
     created_ampere: list[tuple[str, str, str]] = field(default_factory=list)  # (name, instance_id, pip_id)
@@ -508,6 +585,7 @@ class AccountState:
     networking_ids: dict[str, str] | None = None
     lb_id: str | None = None
     subnet_id: str | None = None
+    iam_ids: dict[str, str] | None = None
 
 
 def load_accounts(path: Path, defaults: dict[str, Any]) -> list[AccountState]:
@@ -519,13 +597,26 @@ def load_accounts(path: Path, defaults: dict[str, Any]) -> list[AccountState]:
     states: list[AccountState] = []
     for i, entry in enumerate(entries):
         profile = entry.get("profile")
-        compartment_id = entry.get("compartment_id")
         if not profile:
             raise RuntimeError(f"accounts[{i}] missing required key 'profile'")
-        if not compartment_id:
-            raise RuntimeError(f"accounts[{i}] missing required key 'compartment_id'")
+
+        create_compartment = parse_bool(entry.get("create_compartment", False))
+        compartment_id = entry.get("compartment_id")
+        compartment_name = entry.get("compartment_name")
+
+        if create_compartment:
+            if not compartment_name:
+                raise RuntimeError(
+                    f"accounts[{i}] ({profile}): 'compartment_name' is required when 'create_compartment' is true"
+                )
+        else:
+            if not compartment_id:
+                raise RuntimeError(
+                    f"accounts[{i}] ({profile}): 'compartment_id' is required when 'create_compartment' is false"
+                )
 
         report_output = entry.get("report_output", f"./state/{profile}-import.tf")
+        push = entry.get("report_push", {})
         states.append(AccountState(
             profile=profile,
             compartment_id=compartment_id,
@@ -535,6 +626,14 @@ def load_accounts(path: Path, defaults: dict[str, Any]) -> list[AccountState]:
             micro_names=entry.get("micro_node_names", defaults["micro_node_names"]),
             enable_free_lb=entry.get("enable_free_lb", defaults["enable_free_lb"]),
             lb_display_name=entry.get("lb_display_name", defaults["lb_display_name"]),
+            create_compartment=create_compartment,
+            compartment_name=compartment_name,
+            iam_api_public_key=entry.get("iam_api_public_key"),
+            iam_user_email=entry.get("iam_user_email"),
+            report_push_github_repo=push.get("github_repo"),
+            report_push_github_path=push.get("github_path"),
+            report_push_github_branch=push.get("github_branch", "main"),
+        micro_cloud_init_url=entry.get("micro_cloud_init_url", defaults.get("micro_cloud_init_url")),
         ))
     return states
 
@@ -956,6 +1055,7 @@ def launch_instance(
     boot_size: int,
     ssh_key_file: str,
     shape_config: dict[str, Any] | None = None,
+    user_data_b64: str | None = None,
 ) -> tuple[bool, str]:
     cmd = [
         "compute",
@@ -977,9 +1077,18 @@ def launch_instance(
         subnet_id,
         "--assign-public-ip",
         "false",
-        "--ssh-authorized-keys-file",
-        ssh_key_file,
     ]
+
+    if user_data_b64:
+        # Combine ssh_authorized_keys and user_data in a single --metadata JSON to
+        # avoid OCI CLI merge ambiguity when both flags are set simultaneously.
+        ssh_key = Path(ssh_key_file).read_text(encoding="utf-8").strip()
+        cmd.extend(["--metadata", json.dumps({
+            "ssh_authorized_keys": ssh_key,
+            "user_data": user_data_b64,
+        })])
+    else:
+        cmd.extend(["--ssh-authorized-keys-file", ssh_key_file])
 
     if shape_config:
         cmd.extend(["--shape-config", json.dumps(shape_config)])
@@ -1067,6 +1176,151 @@ def scan_available_ads(
     return available
 
 
+def ensure_iam_setup(oci_cli: OciCli, account: AccountState, tenancy_id: str) -> dict[str, str]:
+    """Create or find compartment + IAM group/user/policy for account.
+
+    Sets account.compartment_id to the resolved compartment OCID.
+    Returns dict of created/found resource OCIDs.
+    """
+    name = account.compartment_name
+    prefix = f"[{account.profile}]"
+
+    # Ensure compartment (child of tenancy)
+    existing = oci_cli.run([
+        "iam", "compartment", "list",
+        "--compartment-id", tenancy_id,
+        "--name", name,
+        "--lifecycle-state", "ACTIVE",
+    ])["data"]
+    if existing:
+        compartment_id = existing[0]["id"]
+        log(f"{prefix} Compartment '{name}' already exists: {compartment_id}")
+    else:
+        result = oci_cli.run([
+            "iam", "compartment", "create",
+            "--compartment-id", tenancy_id,
+            "--name", name,
+            "--description", f"Managed free-tier compartment for {name}",
+        ])["data"]
+        compartment_id = result["id"]
+        log(f"{prefix} Created compartment '{name}': {compartment_id}")
+    account.compartment_id = compartment_id
+
+    group_name = f"{name}-managers"
+    user_name = f"{name}-user"
+    policy_name = f"{name}-policy"
+
+    # Ensure group (tenancy-level)
+    existing_groups = oci_cli.run([
+        "iam", "group", "list",
+        "--compartment-id", tenancy_id,
+        "--name", group_name,
+    ])["data"]
+    if existing_groups:
+        group_id = existing_groups[0]["id"]
+        log(f"{prefix} IAM group '{group_name}' already exists")
+    else:
+        result = oci_cli.run([
+            "iam", "group", "create",
+            "--compartment-id", tenancy_id,
+            "--name", group_name,
+            "--description", f"Service group with access to {name} compartment",
+        ])["data"]
+        group_id = result["id"]
+        log(f"{prefix} Created IAM group '{group_name}': {group_id}")
+
+    # Ensure user (tenancy-level)
+    existing_users = oci_cli.run([
+        "iam", "user", "list",
+        "--compartment-id", tenancy_id,
+        "--name", user_name,
+    ])["data"]
+    if existing_users:
+        user_id = existing_users[0]["id"]
+        log(f"{prefix} IAM user '{user_name}' already exists")
+    else:
+        email = account.iam_user_email or f"{user_name}@noreply.example.com"
+        result = oci_cli.run([
+            "iam", "user", "create",
+            "--compartment-id", tenancy_id,
+            "--name", user_name,
+            "--description", f"Service user for {name} compartment",
+            "--email", email,
+        ])["data"]
+        user_id = result["id"]
+        log(f"{prefix} Created IAM user '{user_name}': {user_id}")
+
+    # Ensure group membership — capture OCID for import report
+    try:
+        membership_result = oci_cli.run([
+            "iam", "group-membership", "create",
+            "--user-id", user_id,
+            "--group-id", group_id,
+        ])["data"]
+        membership_id = membership_result["id"]
+        log(f"{prefix} Added {user_name} to {group_name}: {membership_id}")
+    except OciCliError as exc:
+        msg = str(exc)
+        if not any(token in msg for token in ("already", "409", "Conflict", "duplicate")):
+            raise
+        # Already a member — look up the existing membership OCID
+        existing_memberships = oci_cli.run([
+            "iam", "group-membership", "list",
+            "--compartment-id", tenancy_id,
+            "--user-id", user_id,
+            "--group-id", group_id,
+        ])["data"]
+        membership_id = existing_memberships[0]["id"] if existing_memberships else ""
+        log(f"{prefix} {user_name} already member of {group_name}: {membership_id}")
+
+    # Ensure policy (tenancy-level, granting group access to compartment)
+    existing_policies = oci_cli.run([
+        "iam", "policy", "list",
+        "--compartment-id", tenancy_id,
+        "--name", policy_name,
+    ])["data"]
+    if existing_policies:
+        policy_id = existing_policies[0]["id"]
+        log(f"{prefix} IAM policy '{policy_name}' already exists")
+    else:
+        statements = [f"Allow group {group_name} to manage all-resources in compartment {name}"]
+        result = oci_cli.run([
+            "iam", "policy", "create",
+            "--compartment-id", tenancy_id,
+            "--name", policy_name,
+            "--description", f"Grants {group_name} full access to {name}",
+            "--statements", json.dumps(statements),
+        ])["data"]
+        policy_id = result["id"]
+        log(f"{prefix} Created IAM policy '{policy_name}': {policy_id}")
+
+    ids: dict[str, str] = {
+        "compartment_id": compartment_id,
+        "group_id": group_id,
+        "user_id": user_id,
+        "membership_id": membership_id,
+        "policy_id": policy_id,
+    }
+
+    # Optional API key registration
+    if account.iam_api_public_key:
+        try:
+            result = oci_cli.run([
+                "iam", "api-key", "upload",
+                "--user-id", user_id,
+                "--key", account.iam_api_public_key,
+            ])["data"]
+            fingerprint = result.get("fingerprint", "")
+            ids["api_key_fingerprint"] = fingerprint
+            log(f"{prefix} Registered API key, fingerprint: {fingerprint}")
+        except OciCliError as exc:
+            if "already" not in str(exc).lower():
+                raise
+            log(f"{prefix} API key already registered for {user_name}")
+
+    return ids
+
+
 def provision_account(
     oci_cli: OciCli,
     account: AccountState,
@@ -1079,9 +1333,14 @@ def provision_account(
     Mutates account.created_ampere, account.created_micro, account.subnet_id,
     account.networking_ids, account.lb_id in place.
     """
-    compartment_id = account.compartment_id
     tenancy_ocid = read_profile_values(account.profile)["tenancy"]
     prefix = f"[{account.profile}]"
+
+    # First-time IAM + compartment setup (when create_compartment=True)
+    if account.create_compartment and account.iam_ids is None:
+        account.iam_ids = ensure_iam_setup(oci_cli, account, tenancy_ocid)
+
+    compartment_id = account.compartment_id
 
     # First-time networking setup
     if account.subnet_id is None:
@@ -1115,6 +1374,16 @@ def provision_account(
     ampere_image_id = find_latest_image(oci_cli, compartment_id, "VM.Standard.A1.Flex")
     micro_image_id = find_latest_image(oci_cli, compartment_id, "VM.Standard.E2.1.Micro")
 
+    # Fetch micro cloud-init once per cycle (may be None if not configured).
+    micro_user_data_b64: str | None = None
+    if account.micro_cloud_init_url:
+        try:
+            with urllib.request.urlopen(account.micro_cloud_init_url, timeout=30) as resp:
+                micro_user_data_b64 = base64.b64encode(resp.read()).decode()
+            log(f"{prefix} Fetched micro cloud-init ({len(micro_user_data_b64)} b64 chars)")
+        except urllib.error.URLError as exc:
+            log(f"{prefix} WARNING: failed to fetch micro cloud-init: {exc}; launching without user-data")
+
     ampere_shape_config = {
         "ocpus": float(profile_defaults["ampere_ocpus_per_instance"]),
         "memoryInGBs": float(profile_defaults["ampere_memory_per_instance"]),
@@ -1133,11 +1402,13 @@ def provision_account(
     log(f"{prefix} Existing Micro: {sorted(existing_micro_names)} / targets: {account.micro_names}")
 
     def launch_and_assign_ip(name: str, shape: str, image_id: str, boot_size: int,
-                              ad: str, shape_config: dict | None = None) -> tuple[str, str, str] | None:
+                              ad: str, shape_config: dict | None = None,
+                              user_data_b64: str | None = None) -> tuple[str, str, str] | None:
         ok, detail = launch_instance(
             oci_cli, compartment_id=compartment_id, subnet_id=account.subnet_id,
             ad=ad, name=name, shape=shape, image_id=image_id,
             boot_size=boot_size, ssh_key_file=ssh_key_file, shape_config=shape_config,
+            user_data_b64=user_data_b64,
         )
         if not ok:
             category = classify_oci_error(detail)
@@ -1161,7 +1432,8 @@ def provision_account(
             break
         ad = available_micro_ads[idx % len(available_micro_ads)]
         result = launch_and_assign_ip(name, "VM.Standard.E2.1.Micro", micro_image_id,
-                                       int(profile_defaults["micro_boot_volume_size"]), ad)
+                                       int(profile_defaults["micro_boot_volume_size"]), ad,
+                                       user_data_b64=micro_user_data_b64)
         if result:
             account.created_micro.append(result)
 
@@ -1191,6 +1463,7 @@ def generate_import_report(
     lb_id: str | None,
     ampere_instances: list[tuple[str, str, str]],
     micro_instances: list[tuple[str, str, str]],
+    iam_ids: dict[str, str] | None = None,
 ) -> None:
     """Write a .tf file with tofu import{} blocks for all resources created this run.
 
@@ -1208,6 +1481,16 @@ def generate_import_report(
         "#   tofu apply -var-file=<account>.tfvars -chdir=module/tofu/oci",
         "",
     ]
+    if iam_ids:
+        lines += block("oci_identity_compartment.managed[0]", iam_ids["compartment_id"])
+        lines += block("oci_identity_group.free_tier[0]", iam_ids["group_id"])
+        lines += block("oci_identity_user.free_tier[0]", iam_ids["user_id"])
+        if iam_ids.get("membership_id"):
+            lines += block("oci_identity_user_group_membership.free_tier[0]", iam_ids["membership_id"])
+        lines += block("oci_identity_policy.free_tier[0]", iam_ids["policy_id"])
+        if iam_ids.get("api_key_fingerprint"):
+            api_key_import_id = f"{iam_ids['user_id']}/{iam_ids['api_key_fingerprint']}"
+            lines += block("oci_identity_api_key.free_tier[0]", api_key_import_id)
     if networking:
         lines += block("oci_core_vcn.free_tier_vcn[0]", networking["vcn_id"])
         lines += block("oci_core_internet_gateway.free_tier_igw[0]", networking["igw_id"])
@@ -1226,6 +1509,62 @@ def generate_import_report(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text("\n".join(lines), encoding="utf-8")
     log(f"Import report written to {output_path}")
+
+
+def push_report_to_github(
+    *,
+    content: str,
+    repo: str,
+    path: str,
+    branch: str,
+    token: str,
+    commit_message: str,
+) -> None:
+    """Create or update a file in a GitHub repo via the REST API.
+
+    Uses GITHUB_TOKEN for auth. No git binary required — pure HTTPS.
+    """
+    api_url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type": "application/json",
+    }
+
+    # GET existing file to obtain its SHA (required for updates)
+    existing_sha: str | None = None
+    try:
+        req = urllib.request.Request(f"{api_url}?ref={branch}", headers=headers)
+        with urllib.request.urlopen(req) as resp:
+            existing = json.loads(resp.read())
+            existing_sha = existing.get("sha")
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            raise RuntimeError(f"GitHub GET {path}: HTTP {exc.code} {exc.reason}") from exc
+
+    payload: dict[str, Any] = {
+        "message": commit_message,
+        "content": base64.b64encode(content.encode()).decode(),
+        "branch": branch,
+    }
+    if existing_sha:
+        payload["sha"] = existing_sha
+
+    req = urllib.request.Request(
+        api_url,
+        data=json.dumps(payload).encode(),
+        headers=headers,
+        method="PUT",
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            result = json.loads(resp.read())
+            action = "Updated" if existing_sha else "Created"
+            log(f"GitHub: {action} {repo}/{path} on {branch} — {result['commit']['sha'][:7]}")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode(errors="replace")
+        raise RuntimeError(f"GitHub PUT {path}: HTTP {exc.code} — {body}") from exc
 
 
 def main() -> int:
@@ -1284,7 +1623,24 @@ def main() -> int:
                     lb_id=account.lb_id,
                     ampere_instances=account.created_ampere,
                     micro_instances=account.created_micro,
+                    iam_ids=account.iam_ids,
                 )
+                if account.report_push_github_repo and account.report_push_github_path:
+                    github_token = os.environ.get("GITHUB_TOKEN", "")
+                    if not github_token:
+                        log(f"[{account.profile}] WARNING: report_push configured but GITHUB_TOKEN not set — skipping push")
+                    else:
+                        try:
+                            push_report_to_github(
+                                content=account.report_output.read_text(encoding="utf-8"),
+                                repo=account.report_push_github_repo,
+                                path=account.report_push_github_path,
+                                branch=account.report_push_github_branch,
+                                token=github_token,
+                                commit_message=f"chore: import report for {account.profile} [{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}]",
+                            )
+                        except RuntimeError as exc:
+                            log(f"[{account.profile}] WARNING: GitHub push failed: {exc}")
                 account.done = True
 
         if all(a.done for a in accounts):
