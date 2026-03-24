@@ -548,6 +548,10 @@ def load_profile_defaults(path: Path) -> dict[str, Any]:
         if not isinstance(data[key], (int, float)) or float(data[key]) <= 0:
             raise RuntimeError(f"Profile key '{key}' must be a positive number")
 
+    data.setdefault("max_ampere_ocpus", 4)
+    data.setdefault("max_ampere_ram_gb", 24)
+    data.setdefault("max_micro_instances", 1)
+
     if not isinstance(data["enable_free_lb"], bool):
         raise RuntimeError("Profile key 'enable_free_lb' must be true/false")
 
@@ -578,6 +582,10 @@ class AccountState:
     report_push_github_branch: str = "main"
     # optional cloud-init URL for new micro instances (fetched once per cycle, base64-encoded)
     micro_cloud_init_url: str | None = None
+    # per-tenancy Always Free capacity limits (guards against over-provisioning)
+    max_ampere_ocpus: int = 4
+    max_ampere_ram_gb: int = 24
+    max_micro_instances: int = 1
     # mutable per-run tracking
     done: bool = False
     created_ampere: list[tuple[str, str, str]] = field(default_factory=list)  # (name, instance_id, pip_id)
@@ -634,6 +642,9 @@ def load_accounts(path: Path, defaults: dict[str, Any]) -> list[AccountState]:
             report_push_github_path=push.get("github_path"),
             report_push_github_branch=push.get("github_branch", "main"),
         micro_cloud_init_url=entry.get("micro_cloud_init_url", defaults.get("micro_cloud_init_url")),
+        max_ampere_ocpus=int(entry.get("max_ampere_ocpus", defaults["max_ampere_ocpus"])),
+        max_ampere_ram_gb=int(entry.get("max_ampere_ram_gb", defaults["max_ampere_ram_gb"])),
+        max_micro_instances=int(entry.get("max_micro_instances", defaults["max_micro_instances"])),
         ))
     return states
 
@@ -919,6 +930,12 @@ def ensure_free_tier_load_balancer(
     for lb in lbs:
         if lb.get("display-name") == display_name:
             lb_id = lb["id"]
+            state = lb.get("lifecycle-state", "")
+            if state == "FAILED":
+                log(f"Load Balancer '{display_name}' ({lb_id}) is in FAILED state — deleting and recreating")
+                oci.run(["lb", "load-balancer", "delete", "--load-balancer-id", lb_id, "--force"],
+                        expect_json=False)
+                break
             log(f"Using existing Load Balancer '{display_name}' ({lb_id})")
             active = wait_load_balancer_active(oci, lb_id)
             ip_details = active.get("ip-address-details", [])
@@ -999,6 +1016,31 @@ def list_existing_instances(oci: OciCli, compartment_id: str, name_prefix: str, 
         and (not name_prefix or inst.get("display-name", "").startswith(name_prefix))
         and inst.get("lifecycle-state") in keep_states
     ]
+
+
+def free_tier_headroom(
+    existing_ampere: list[dict[str, Any]],
+    existing_micro: list[dict[str, Any]],
+    account: "AccountState",
+) -> tuple[float, float, int]:
+    """Return remaining (ampere_ocpu, ampere_ram_gb, micro_count) headroom.
+
+    Values are computed from live OCI state (the existing_* lists) vs per-account limits.
+    Negative values mean the tenancy is already over the configured limit.
+    """
+    used_ocpus = sum(
+        float((inst.get("shape-config") or {}).get("ocpus", 0))
+        for inst in existing_ampere
+    )
+    used_ram = sum(
+        float((inst.get("shape-config") or {}).get("memory-in-gbs", 0))
+        for inst in existing_ampere
+    )
+    return (
+        account.max_ampere_ocpus - used_ocpus,
+        account.max_ampere_ram_gb - used_ram,
+        account.max_micro_instances - len(existing_micro),
+    )
 
 
 def capacity_available(
@@ -1401,6 +1443,13 @@ def provision_account(
     log(f"{prefix} Existing A1: {sorted(existing_ampere_names)} / targets: {account.ampere_names}")
     log(f"{prefix} Existing Micro: {sorted(existing_micro_names)} / targets: {account.micro_names}")
 
+    headroom_ocpu, headroom_ram, headroom_micro = free_tier_headroom(existing, existing_micro, account)
+    log(
+        f"{prefix} Free tier headroom — A1 OCPU: {headroom_ocpu:.1f}/{account.max_ampere_ocpus}"
+        f", RAM: {headroom_ram:.1f}/{account.max_ampere_ram_gb} GB"
+        f", Micro: {headroom_micro}/{account.max_micro_instances}"
+    )
+
     def launch_and_assign_ip(name: str, shape: str, image_id: str, boot_size: int,
                               ad: str, shape_config: dict | None = None,
                               user_data_b64: str | None = None) -> tuple[str, str, str] | None:
@@ -1427,6 +1476,9 @@ def provision_account(
     # Launch missing Micro
     created_names_micro = {n for n, _, _ in account.created_micro}
     for idx, name in enumerate(n for n in account.micro_names if n not in existing_micro_names | created_names_micro):
+        if headroom_micro <= 0:
+            log(f"{prefix} Micro limit reached ({len(existing_micro)}/{account.max_micro_instances}), skipping {name}")
+            break
         if not available_micro_ads:
             log(f"{prefix} No ADs with Micro capacity this cycle")
             break
@@ -1436,10 +1488,19 @@ def provision_account(
                                        user_data_b64=micro_user_data_b64)
         if result:
             account.created_micro.append(result)
+            headroom_micro -= 1
 
     # Launch missing Ampere
     created_names_ampere = {n for n, _, _ in account.created_ampere}
     for idx, name in enumerate(n for n in account.ampere_names if n not in existing_ampere_names | created_names_ampere):
+        inst_ocpus = float(ampere_shape_config["ocpus"])
+        inst_ram = float(ampere_shape_config["memoryInGBs"])
+        if headroom_ocpu < inst_ocpus:
+            log(f"{prefix} A1 OCPU limit reached (headroom {headroom_ocpu:.1f} < {inst_ocpus}), skipping {name}")
+            break
+        if headroom_ram < inst_ram:
+            log(f"{prefix} A1 RAM limit reached (headroom {headroom_ram:.1f} GB < {inst_ram} GB), skipping {name}")
+            break
         if not available_ampere_ads:
             log(f"{prefix} No ADs with Ampere capacity this cycle")
             break
@@ -1449,6 +1510,8 @@ def provision_account(
                                        shape_config=ampere_shape_config)
         if result:
             account.created_ampere.append(result)
+            headroom_ocpu -= inst_ocpus
+            headroom_ram -= inst_ram
 
     # Check completion
     all_ampere = existing_ampere_names | {n for n, _, _ in account.created_ampere}
