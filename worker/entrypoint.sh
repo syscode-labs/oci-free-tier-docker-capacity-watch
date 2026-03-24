@@ -6,6 +6,8 @@ SUCCESS_MARKER="${STATE_DIR}/success_notified"
 NOTIFY_BACKEND="${NOTIFY_BACKEND:-none}"
 UNRAID_NOTIFY_CMD="${UNRAID_NOTIFY_CMD:-/usr/local/bin/unraid-notify}"
 NOTIFY_WEBHOOK_URL="${NOTIFY_WEBHOOK_URL:-}"
+TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 
 notify_success() {
   local message="OCI free-tier target profile reached for all accounts."
@@ -33,6 +35,16 @@ notify_success() {
           "$NOTIFY_WEBHOOK_URL" >/dev/null || echo "[notify] webhook delivery failed"
       else
         echo "[notify] NOTIFY_WEBHOOK_URL empty"
+      fi
+      ;;
+    telegram)
+      if [[ -n "$TELEGRAM_BOT_TOKEN" && -n "$TELEGRAM_CHAT_ID" ]]; then
+        curl -fsS -X POST \
+          "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          -d "chat_id=${TELEGRAM_CHAT_ID}&text=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$message")" \
+          >/dev/null || echo "[notify] telegram delivery failed"
+      else
+        echo "[notify] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set"
       fi
       ;;
     *)
@@ -67,6 +79,16 @@ notify_failure() {
           "$NOTIFY_WEBHOOK_URL" >/dev/null || echo "[notify] webhook delivery failed"
       else
         echo "[notify] NOTIFY_WEBHOOK_URL empty"
+      fi
+      ;;
+    telegram)
+      if [[ -n "$TELEGRAM_BOT_TOKEN" && -n "$TELEGRAM_CHAT_ID" ]]; then
+        curl -fsS -X POST \
+          "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          -d "chat_id=${TELEGRAM_CHAT_ID}&text=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$message")" \
+          >/dev/null || echo "[notify] telegram delivery failed"
+      else
+        echo "[notify] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set"
       fi
       ;;
     *)
