@@ -1746,11 +1746,30 @@ def main() -> int:
         ads_by_profile[account.profile] = get_availability_domains(cli, pv["tenancy"])
         log(f"[{account.profile}] ADs: {', '.join(ads_by_profile[account.profile])}")
 
+    state_dir = Path(os.environ.get("STATE_DIR", "/app/state"))
+    ctx = BotContext(accounts=accounts)
+
+    try:
+        from telegram_bot import make_bot_from_env  # type: ignore[import]
+        bot = make_bot_from_env(ctx, state_dir)
+    except ImportError:
+        bot = None
+
+    if bot:
+        bot.start()
+        log("Telegram bot started")
+    else:
+        log("Telegram bot disabled (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set)")
+
     attempt = 0
     while True:
         attempt += 1
         pending = [a for a in accounts if not a.done]
         log(f"--- Cycle #{attempt} — {len(pending)} account(s) pending ---")
+
+        with ctx.lock:
+            ctx.cycle = attempt
+            ctx.last_cycle_at = datetime.now()
 
         for account in pending:
             cli = clients[account.profile]
@@ -1760,6 +1779,8 @@ def main() -> int:
                 done = provision_account(cli, account, profile_defaults, ads, ssh_key_file)
             except RuntimeError as exc:
                 log(f"[{account.profile}] Fatal error: {exc}")
+                with ctx.lock:
+                    ctx.last_error = str(exc)
                 return 1
             if done:
                 log(f"[{account.profile}] Targets satisfied — writing import report")
@@ -1791,6 +1812,14 @@ def main() -> int:
 
         if all(a.done for a in accounts):
             log("All accounts satisfied. Done.")
+            with ctx.lock:
+                ctx.done = True
+            success_marker = state_dir / "success_notified"
+            success_marker.touch()
+            log("Success marker written.")
+            if bot and bot.is_alive():
+                log("Provisioning complete — bot thread keeps container alive")
+                bot.join()
             return 0
 
         if args.max_attempts > 0 and attempt >= args.max_attempts:
