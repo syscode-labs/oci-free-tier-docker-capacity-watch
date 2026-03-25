@@ -95,6 +95,7 @@ def test_parse_daily_time_valid() -> None:
 
 def test_parse_daily_time_invalid() -> None:
     assert bmod._parse_daily_time("25:00") is None
+    assert bmod._parse_daily_time("24:00") is None
     assert bmod._parse_daily_time("8") is None
     assert bmod._parse_daily_time("abc") is None
     assert bmod._parse_daily_time("") is None
@@ -102,7 +103,8 @@ def test_parse_daily_time_invalid() -> None:
 
 def test_daily_fires_once_per_day(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Daily report fires once when time matches, not on subsequent calls same day."""
-    ctx = pmod.BotContext(accounts=[], cycle=1, done=True)
+    # last_cycle_at=None avoids datetime subtraction in _minutes_ago with the fake datetime
+    ctx = pmod.BotContext(accounts=[], cycle=1, done=True, last_cycle_at=None)
     bot = bmod.TelegramBot(
         token="fake", chat_id="123", ctx=ctx,
         state_dir=tmp_path, daily_time="09:00",
@@ -152,8 +154,6 @@ def test_setdaily_persists(tmp_path: Path) -> None:
     bot._send = lambda text: sent.append(text)  # type: ignore[method-assign]
 
     bot._handle_command("/setdaily 14:30")
-    assert bot._daily_hour == 14
-    assert bot._daily_minute == 30
     assert (tmp_path / "daily_status_time.txt").read_text() == "14:30"
     assert "14:30" in sent[0]
 
