@@ -99,6 +99,20 @@ class _FakeLbClient:
     pass
 
 
+class _FakeBudgetClient:
+    def list_budgets(self, **kwargs):
+        return SimpleNamespace(data=[])
+
+    def create_budget(self, details):
+        return SimpleNamespace(data=SimpleNamespace(id="ocid1.budget.oc1..fake"))
+
+    def list_alert_rules(self, **kwargs):
+        return SimpleNamespace(data=[])
+
+    def create_alert_rule(self, budget_id, details):
+        return SimpleNamespace(data=SimpleNamespace(id="ocid1.alertrule.oc1..fake"))
+
+
 def _fake_list_call_get_all_results(fn, **kwargs):  # noqa: ANN001, ANN003
     return SimpleNamespace(data=fn(**kwargs).data)
 
@@ -108,6 +122,7 @@ def test_oci_sdk_mapping_list_and_capacity_report(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(mod.oci.core, "VirtualNetworkClient", lambda _cfg: _FakeNetworkClient())
     monkeypatch.setattr(mod.oci.core, "ComputeClient", lambda _cfg: _FakeComputeClient())
     monkeypatch.setattr(mod.oci.load_balancer, "LoadBalancerClient", lambda _cfg: _FakeLbClient())
+    monkeypatch.setattr(mod.oci.budget, "BudgetClient", lambda _cfg: _FakeBudgetClient())
     monkeypatch.setattr(mod, "list_call_get_all_results", _fake_list_call_get_all_results)
 
     cli = mod.OciCli(profile="gf78", config={"region": "eu-frankfurt-1"})
@@ -180,6 +195,9 @@ def _minimal_defaults() -> dict[str, Any]:
         "micro_boot_volume_size": 50,
         "enable_free_lb": True,
         "lb_display_name": "free-tier-lb",
+        "max_ampere_ocpus": 4,
+        "max_ampere_ram_gb": 24,
+        "max_micro_instances": 1,
     }
 
 
@@ -280,6 +298,7 @@ def test_oci_sdk_vnic_and_reserved_ip(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(mod.oci.core, "VirtualNetworkClient", lambda _cfg: _FakeNetworkClientWithPrivateIp())
     monkeypatch.setattr(mod.oci.core, "ComputeClient", lambda _cfg: _FakeComputeClientWithVnic())
     monkeypatch.setattr(mod.oci.load_balancer, "LoadBalancerClient", lambda _cfg: _FakeLbClient())
+    monkeypatch.setattr(mod.oci.budget, "BudgetClient", lambda _cfg: _FakeBudgetClient())
     monkeypatch.setattr(mod, "list_call_get_all_results", _fake_list_call_get_all_results)
 
     cli = mod.OciCli(profile="gf78", config={"region": "eu-frankfurt-1"})
@@ -317,6 +336,7 @@ def _make_cli_with_reserved_ip(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(mod.oci.core, "VirtualNetworkClient", lambda _cfg: _FakeNetworkClientWithPrivateIp())
     monkeypatch.setattr(mod.oci.core, "ComputeClient", lambda _cfg: _FakeComputeClientWithVnic())
     monkeypatch.setattr(mod.oci.load_balancer, "LoadBalancerClient", lambda _cfg: _FakeLbClient())
+    monkeypatch.setattr(mod.oci.budget, "BudgetClient", lambda _cfg: _FakeBudgetClient())
     monkeypatch.setattr(mod, "list_call_get_all_results", _fake_list_call_get_all_results)
     return mod.OciCli(profile="gf78", config={"region": "eu-frankfurt-1"})
 
@@ -492,6 +512,7 @@ def _make_iam_cli(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr(mod.oci.core, "VirtualNetworkClient", lambda _cfg: _FakeNetworkClient())
     monkeypatch.setattr(mod.oci.core, "ComputeClient", lambda _cfg: _FakeComputeClient())
     monkeypatch.setattr(mod.oci.load_balancer, "LoadBalancerClient", lambda _cfg: _FakeLbClient())
+    monkeypatch.setattr(mod.oci.budget, "BudgetClient", lambda _cfg: _FakeBudgetClient())
     monkeypatch.setattr(mod, "list_call_get_all_results", _fake_list_call_get_all_results)
     return mod.OciCli(profile="gf78", config={"region": "eu-frankfurt-1"})
 
@@ -549,6 +570,7 @@ def test_ensure_iam_setup_idempotent_existing_resources(monkeypatch: pytest.Monk
     monkeypatch.setattr(mod.oci.core, "VirtualNetworkClient", lambda _cfg: _FakeNetworkClient())
     monkeypatch.setattr(mod.oci.core, "ComputeClient", lambda _cfg: _FakeComputeClient())
     monkeypatch.setattr(mod.oci.load_balancer, "LoadBalancerClient", lambda _cfg: _FakeLbClient())
+    monkeypatch.setattr(mod.oci.budget, "BudgetClient", lambda _cfg: _FakeBudgetClient())
     monkeypatch.setattr(mod, "list_call_get_all_results", _fake_list_call_get_all_results)
 
     cli = mod.OciCli(profile="gf78", config={"region": "eu-frankfurt-1"})
@@ -692,6 +714,7 @@ def test_oci_sdk_mapping_unsupported_command(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(mod.oci.core, "VirtualNetworkClient", lambda _cfg: _FakeNetworkClient())
     monkeypatch.setattr(mod.oci.core, "ComputeClient", lambda _cfg: _FakeComputeClient())
     monkeypatch.setattr(mod.oci.load_balancer, "LoadBalancerClient", lambda _cfg: _FakeLbClient())
+    monkeypatch.setattr(mod.oci.budget, "BudgetClient", lambda _cfg: _FakeBudgetClient())
 
     cli = mod.OciCli(profile="gf78", config={"region": "eu-frankfurt-1"})
 
