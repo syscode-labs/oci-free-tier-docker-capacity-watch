@@ -23,7 +23,7 @@ def _tg(token: str, method: str, **params: Any) -> dict[str, Any]:
     data = urllib.parse.urlencode(params).encode()
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
-    with urllib.request.urlopen(req, timeout=35) as resp:
+    with urllib.request.urlopen(req, timeout=60) as resp:
         return json.loads(resp.read())
 
 
@@ -107,7 +107,7 @@ class TelegramBot(threading.Thread):
         self._daily_file = state_dir / "daily_status_time.txt"
         self._daily_tz = _resolve_tz(daily_tz)
         self._daily_hour, self._daily_minute = self._load_daily_time(daily_time)
-        self._last_daily_date: date | None = None
+        self._last_daily_fired: tuple[date, int, int] | None = None
         self._offset = 0
 
     def _load_daily_time(self, default: str) -> tuple[int, int]:
@@ -153,12 +153,13 @@ class TelegramBot(threading.Thread):
     def _check_daily(self) -> None:
         now = datetime.now(self._daily_tz)
         today = now.date()
+        fired_key = (today, self._daily_hour, self._daily_minute)
         if (
             now.hour == self._daily_hour
             and now.minute == self._daily_minute
-            and today != self._last_daily_date
+            and self._last_daily_fired != fired_key
         ):
-            self._last_daily_date = today
+            self._last_daily_fired = fired_key
             msg = f"📅 Daily status — {today.isoformat()}\n\n{format_status(self._ctx)}"
             self._send(msg)
 
