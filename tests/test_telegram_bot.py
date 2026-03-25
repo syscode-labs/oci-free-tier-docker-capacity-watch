@@ -112,14 +112,14 @@ def test_daily_fires_once_per_day(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
 
     from datetime import date
 
-    fixed_date = date(2026, 3, 25)
+    current_date: list[date] = [date(2026, 3, 25)]
 
     class _FakeNow:
         def __init__(self, h: int, m: int) -> None:
             self.hour = h
             self.minute = m
         def date(self) -> date:
-            return fixed_date
+            return current_date[0]
 
     class _FakeDatetime:
         @staticmethod
@@ -135,6 +135,11 @@ def test_daily_fires_once_per_day(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     # Second call same minute same day — should NOT fire again
     bot._check_daily()
     assert len(sent) == 1
+
+    # Third call on next day — should fire again
+    current_date[0] = date(2026, 3, 26)
+    bot._check_daily()
+    assert len(sent) == 2
 
 
 def test_setdaily_persists(tmp_path: Path) -> None:
