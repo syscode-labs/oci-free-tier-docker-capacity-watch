@@ -85,3 +85,86 @@ def test_format_status_no_accounts() -> None:
     ctx = pmod.BotContext(accounts=[], cycle=0, done=False)
     msg = bmod.format_status(ctx)
     assert msg  # non-empty
+
+
+def test_parse_daily_time_valid() -> None:
+    assert bmod._parse_daily_time("08:00") == (8, 0)
+    assert bmod._parse_daily_time("23:59") == (23, 59)
+    assert bmod._parse_daily_time("00:00") == (0, 0)
+
+
+def test_parse_daily_time_invalid() -> None:
+    assert bmod._parse_daily_time("25:00") is None
+    assert bmod._parse_daily_time("8") is None
+    assert bmod._parse_daily_time("abc") is None
+    assert bmod._parse_daily_time("") is None
+
+
+def test_daily_fires_once_per_day(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Daily report fires once when time matches, not on subsequent calls same day."""
+    ctx = pmod.BotContext(accounts=[], cycle=1, done=True)
+    bot = bmod.TelegramBot(
+        token="fake", chat_id="123", ctx=ctx,
+        state_dir=tmp_path, daily_time="09:00",
+    )
+    sent: list[str] = []
+    monkeypatch.setattr(bot, "_send", lambda text: sent.append(text))
+
+    from datetime import date
+
+    fixed_date = date(2026, 3, 25)
+
+    class _FakeNow:
+        def __init__(self, h: int, m: int) -> None:
+            self.hour = h
+            self.minute = m
+        def date(self) -> date:
+            return fixed_date
+
+    class _FakeDatetime:
+        @staticmethod
+        def now(tz=None) -> _FakeNow:
+            return _FakeNow(9, 0)
+
+    # First call at 09:00 — should fire
+    monkeypatch.setattr(bmod, "datetime", _FakeDatetime)
+    bot._check_daily()
+    assert len(sent) == 1
+    assert "Daily status" in sent[0]
+
+    # Second call same minute same day — should NOT fire again
+    bot._check_daily()
+    assert len(sent) == 1
+
+
+def test_setdaily_persists(tmp_path: Path) -> None:
+    ctx = pmod.BotContext(accounts=[], cycle=0, done=False)
+    bot = bmod.TelegramBot(
+        token="fake", chat_id="123", ctx=ctx,
+        state_dir=tmp_path, daily_time="08:00",
+    )
+    sent: list[str] = []
+    bot._send = lambda text: sent.append(text)  # type: ignore[method-assign]
+
+    bot._handle_command("/setdaily 14:30")
+    assert bot._daily_hour == 14
+    assert bot._daily_minute == 30
+    assert (tmp_path / "daily_status_time.txt").read_text() == "14:30"
+    assert "14:30" in sent[0]
+
+
+def test_make_bot_from_env_no_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    ctx = pmod.BotContext(accounts=[], cycle=0, done=False)
+    assert bmod.make_bot_from_env(ctx, tmp_path) is None
+
+
+def test_make_bot_from_env_with_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok123")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "456")
+    ctx = pmod.BotContext(accounts=[], cycle=0, done=False)
+    bot = bmod.make_bot_from_env(ctx, tmp_path)
+    assert bot is not None
+    assert bot._token == "tok123"
+    assert bot._chat_id == "456"
