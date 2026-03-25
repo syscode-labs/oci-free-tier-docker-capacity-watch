@@ -17,6 +17,7 @@ import math
 import os
 import sys
 import time
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -599,6 +600,17 @@ class AccountState:
     lb_id: str | None = None
     subnet_id: str | None = None
     iam_ids: dict[str, str] | None = None
+
+
+@dataclass
+class BotContext:
+    """Shared state between the provisioner loop and the Telegram bot thread."""
+    accounts: list[AccountState]
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    cycle: int = 0
+    done: bool = False
+    last_cycle_at: datetime | None = None
+    last_error: str | None = None
 
 
 def load_accounts(path: Path, defaults: dict[str, Any]) -> list[AccountState]:

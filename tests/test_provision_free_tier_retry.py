@@ -720,3 +720,11 @@ def test_oci_sdk_mapping_unsupported_command(monkeypatch: pytest.MonkeyPatch) ->
 
     with pytest.raises(mod.OciCliError):
         cli.run(["database", "db-system", "list"])
+
+
+def test_bot_context_defaults() -> None:
+    ctx = mod.BotContext(accounts=[])
+    assert ctx.cycle == 0
+    assert ctx.done is False
+    assert ctx.last_error is None
+    assert ctx.last_cycle_at is None
