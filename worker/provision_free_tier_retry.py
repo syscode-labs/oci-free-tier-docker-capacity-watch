@@ -50,6 +50,7 @@ class OciCli:
         self.network_client = oci.core.VirtualNetworkClient(self.config)
         self.compute_client = oci.core.ComputeClient(self.config)
         self.lb_client = oci.load_balancer.LoadBalancerClient(self.config)
+        self.budget_client = oci.budget.BudgetClient(self.config)
 
     @staticmethod
     def _flag(args: list[str], name: str, default: str | None = None) -> str | None:
@@ -582,6 +583,10 @@ class AccountState:
     report_push_github_branch: str = "main"
     # optional cloud-init URL for new micro instances (fetched once per cycle, base64-encoded)
     micro_cloud_init_url: str | None = None
+    # optional spend guard: create an OCI budget on first cycle if set
+    budget_amount: float | None = None
+    budget_alert_email: str | None = None
+    budget_alert_threshold: float = 80.0
     # per-tenancy Always Free capacity limits (guards against over-provisioning)
     max_ampere_ocpus: int = 4
     max_ampere_ram_gb: int = 24
@@ -642,6 +647,9 @@ def load_accounts(path: Path, defaults: dict[str, Any]) -> list[AccountState]:
             report_push_github_path=push.get("github_path"),
             report_push_github_branch=push.get("github_branch", "main"),
         micro_cloud_init_url=entry.get("micro_cloud_init_url", defaults.get("micro_cloud_init_url")),
+        budget_amount=float(entry["budget_amount"]) if entry.get("budget_amount") is not None else None,
+        budget_alert_email=entry.get("budget_alert_email"),
+        budget_alert_threshold=float(entry.get("budget_alert_threshold", 80.0)),
         max_ampere_ocpus=int(entry.get("max_ampere_ocpus", defaults["max_ampere_ocpus"])),
         max_ampere_ram_gb=int(entry.get("max_ampere_ram_gb", defaults["max_ampere_ram_gb"])),
         max_micro_instances=int(entry.get("max_micro_instances", defaults["max_micro_instances"])),
@@ -904,6 +912,59 @@ def ensure_subnet(
     )["data"]
     log(f"Created subnet '{name}' ({created['id']})")
     return created["id"]
+
+
+def ensure_budget(
+    oci_cli: OciCli,
+    tenancy_ocid: str,
+    display_name: str,
+    amount: float,
+    alert_email: str,
+    alert_threshold: float = 80.0,
+) -> None:
+    """Create an OCI budget + 80% alert rule on the tenancy root if not already present."""
+    budgets = list_call_get_all_results(
+        oci_cli.budget_client.list_budgets,
+        compartment_id=tenancy_ocid,
+    ).data
+    budget_id: str | None = None
+    for b in budgets:
+        if b.display_name == display_name and b.lifecycle_state == "ACTIVE":
+            budget_id = b.id
+            log(f"Budget '{display_name}' already exists ({budget_id})")
+            break
+
+    if budget_id is None:
+        details = oci.budget.models.CreateBudgetDetails(
+            compartment_id=tenancy_ocid,
+            display_name=display_name,
+            amount=amount,
+            reset_period="MONTHLY",
+            target_type="COMPARTMENT",
+            targets=[tenancy_ocid],
+        )
+        result = oci_cli.budget_client.create_budget(details)
+        budget_id = result.data.id
+        log(f"Created budget '{display_name}' (${amount}/month) — {budget_id}")
+
+    # Ensure alert rule exists
+    alert_rules = list_call_get_all_results(
+        oci_cli.budget_client.list_alert_rules,
+        budget_id=budget_id,
+    ).data
+    for rule in alert_rules:
+        if rule.lifecycle_state == "ACTIVE":
+            return  # at least one active rule exists, good enough
+
+    alert_details = oci.budget.models.CreateAlertRuleDetails(
+        display_name=f"{display_name}-alert",
+        type="ACTUAL",
+        threshold=alert_threshold,
+        threshold_type="PERCENTAGE",
+        recipients=alert_email,
+    )
+    oci_cli.budget_client.create_alert_rule(budget_id, alert_details)
+    log(f"Created budget alert rule ({alert_threshold}% threshold → {alert_email})")
 
 
 def wait_load_balancer_active(oci: OciCli, lb_id: str, max_wait_seconds: int = 900) -> dict[str, Any]:
@@ -1377,6 +1438,16 @@ def provision_account(
     """
     tenancy_ocid = read_profile_values(account.profile)["tenancy"]
     prefix = f"[{account.profile}]"
+
+    # First-time spend guard: ensure OCI budget exists (PAYG accounts)
+    if account.budget_amount is not None and account.budget_alert_email:
+        budget_name = f"{account.profile}-monthly-spend-guard"
+        try:
+            ensure_budget(oci_cli, tenancy_ocid, budget_name,
+                          account.budget_amount, account.budget_alert_email,
+                          account.budget_alert_threshold)
+        except Exception as exc:  # noqa: BLE001
+            log(f"{prefix} WARNING: budget setup failed (non-fatal): {exc}")
 
     # First-time IAM + compartment setup (when create_compartment=True)
     if account.create_compartment and account.iam_ids is None:
