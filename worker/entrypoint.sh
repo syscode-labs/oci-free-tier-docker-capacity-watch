@@ -104,16 +104,10 @@ if [[ -f "$SUCCESS_MARKER" ]]; then
   exec tail -f /dev/null
 fi
 
-if python3 /app/worker/provision_free_tier_retry.py "$@"; then
-  rc=0
-else
-  rc=$?
-fi
-if [[ $rc -eq 0 ]]; then
-  notify_success
-  touch "$SUCCESS_MARKER"
-  exec tail -f /dev/null
-fi
+python3 /app/worker/provision_free_tier_retry.py "$@"
+rc=$?
 
-notify_failure "Watcher exited with code ${rc}. Check container logs for OCI error classification."
+if [[ $rc -ne 0 ]]; then
+  notify_failure "Watcher exited with code ${rc}. Check container logs for OCI error classification."
+fi
 exit $rc
