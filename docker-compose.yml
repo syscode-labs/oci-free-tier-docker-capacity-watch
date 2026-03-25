@@ -11,6 +11,8 @@ services:
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       DAILY_STATUS_TIME: ${DAILY_STATUS_TIME:-08:00}
       DAILY_STATUS_TZ: ${DAILY_STATUS_TZ:-UTC}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
     command:
       - --accounts-file=/app/config/accounts.json
       - --profile-defaults-file=/app/config/profile.defaults.json
