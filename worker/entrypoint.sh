@@ -100,8 +100,8 @@ notify_failure() {
 mkdir -p "$STATE_DIR"
 
 if [[ -f "$SUCCESS_MARKER" ]]; then
-  echo "[entrypoint] success marker already present: $SUCCESS_MARKER"
-  exec tail -f /dev/null
+  echo "[entrypoint] success marker present — running in bot-only mode"
+  exec python3 /app/worker/provision_free_tier_retry.py "$@"
 fi
 
 python3 /app/worker/provision_free_tier_retry.py "$@"
